@@ -37,7 +37,13 @@ def load(cache: Path):
             continue  # needs cache/<category>/<clip>.npy
         X.append(np.load(npy))
         y.append(rel.parts[0])
-        groups.append(f"{rel.parts[0]}/{group_of(npy.stem)}")
+        # Group on the video id ALONE. Prefixing the category (rel.parts[0]) makes
+        # one video look like N groups, one per technique it contains -- so
+        # GroupShuffleSplit happily puts oshidashi/VID in train and yorikiri/VID in
+        # test, which is the same video on both sides and exactly the leak this
+        # grouping exists to stop. Observed as "12 clips into 6 source videos" for
+        # 12 clips that all came from a single video.
+        groups.append(group_of(npy.stem))
         names.append(str(rel))
     if not X:
         raise SystemExit(f"no .npy under {cache}/ -- run extract_features.py first")
@@ -83,6 +89,18 @@ def main() -> None:
 
     if len(counts) < 2:
         raise SystemExit("need >=2 categories to train a classifier")
+
+    # A leakage-safe split needs at least two source VIDEOS -- more clips do not
+    # help. Caught here with an explanation, because GroupShuffleSplit's own error
+    # ("With n_samples=1, test_size=0.25 ... train set will be empty") describes
+    # groups as samples and reads like a parameter problem rather than "label more
+    # videos".
+    if n_groups < 2:
+        raise SystemExit(
+            f"only {n_groups} source video in {args.cache}/ -- a leakage-safe split "
+            f"needs >=2.\nLabel bouts from more videos (clips from one video are "
+            f"near-duplicates: same venue,\nlighting, camera and often wrestlers, so "
+            f"a within-video score means nothing).")
 
     # Loud warnings beat a silently misleading score.
     if n_groups < len(X):
