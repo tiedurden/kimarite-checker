@@ -1,0 +1,27 @@
+# Video data. Never commit these -- raw/ alone is ~400 MB for 4 videos and the
+# full set is 64 h of footage. Everything here is re-derivable: fetch_playlist.py
+# re-downloads raw/, and the rest is generated from it.
+raw/
+crops/
+data/
+data_hb/
+cache/
+models/
+*.mp4
+*.png
+*.npy
+
+# Generated manifests / labels -- rebuild with hb_manifest.py + hb_label.py.
+# Committing them would also publish a scrape of another channel's metadata.
+hb_bouts.csv
+hb_labels.csv
+hb_no_timestamps.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local environment. env.sh.example is committed instead: the real one gets
+# edited with machine-specific paths (and, on a corporate network, proxy hosts).
+env.sh
