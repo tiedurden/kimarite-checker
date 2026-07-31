@@ -42,9 +42,24 @@ PLAYLISTS_HB = {
 # including them contaminates the test.
 OVERLAPS_NHK = {"nagoya2026", "natsu2026"}
 
-# "01:55 - Ryuden vs Kotoeiho"  /  "1:23:45 - A vs B"  /  en-dash, "VS", "v."
+# Longest plausible bout window: pre-bout ritual (shikiri) can run 4 min in the
+# top division, plus the bout and replay. Measured windows: min 38s, median 86s,
+# max 292s. Anything past this is a description artefact, not a bout.
+MAX_BOUT = 300
+
+# Herbert uses (at least) two description formats, and the separator is NOT
+# reliable -- an earlier version required one and silently dropped every bout in
+# the no-separator videos, which then looked like "no timestamps" and got routed
+# to onset detection for nothing:
+#
+#   "01:55 - Ryuden vs Kotoeiho"   2026 sets: dash (or en/em-dash, or colon)
+#   "01:09 Tamashoho vs Shishi"    2025 sets: whitespace only
+#
+# So the separator is optional. The "A vs B" part is what actually identifies a
+# bout line, and it stays mandatory -- that's what keeps "00:00 - Intro / Start"
+# and "01:09 Leader board entering" out.
 TS_RE = re.compile(
-    r"^\s*(?P<ts>(?:\d{1,2}:)?\d{1,2}:\d{2})\s*[-–—:]\s*"
+    r"^\s*(?P<ts>(?:\d{1,2}:)?\d{1,2}:\d{2})\s*[-–—:]?\s+"
     r"(?P<a>[A-Za-z][\w'\-\.]*)\s+(?:vs?\.?|VS)\s+(?P<b>[A-Za-z][\w'\-\.]*)",
     re.IGNORECASE,
 )
@@ -118,7 +133,7 @@ def main() -> None:
     if args.exclude_nhk_overlap:
         print(f"excluding NHK-overlapping tournaments: {sorted(OVERLAPS_NHK)}\n")
 
-    rows, no_ts = [], []
+    rows, no_ts, over = [], [], {}
     for name, pl in sets.items():
         vids = playlist_videos(pl)
         print(f"=== {name} ({len(vids)} videos)")
@@ -134,6 +149,15 @@ def main() -> None:
                 end = bouts[i + 1]["start"] if i + 1 < len(bouts) else dur
                 if end <= b["start"]:
                     continue
+                # A real bout window (ritual + bout + replay) runs ~40-300s.
+                # Anything longer means the description was truncated or a
+                # timestamp is missing, so this "bout" is actually the rest of
+                # the video -- observed at 29 min. Clamp it: hb_label.py searches
+                # only the window TAIL, so an over-long window makes it look for
+                # the caption in the wrong place entirely and the bout is lost.
+                if end - b["start"] > MAX_BOUT:
+                    end = b["start"] + MAX_BOUT
+                    over[name] = over.get(name, 0) + 1
                 rows.append({
                     "tournament": name, "video": vid, "n": i + 1,
                     "start": b["start"], "end": end,
@@ -156,6 +180,10 @@ def main() -> None:
     print(f"\n{len(rows)} bouts -> {args.out}")
     for t, n in sorted(by_t.items()):
         print(f"  {t:<14} {n:>4}")
+    if over:
+        print(f"\nclamped {sum(over.values())} over-long window(s) to {MAX_BOUT}s "
+              f"(truncated description / missing timestamp): "
+              + ", ".join(f"{k}:{v}" for k, v in sorted(over.items())))
     if no_ts:
         Path("hb_no_timestamps.json").write_text(json.dumps(no_ts, indent=2))
         print(f"\n{len(no_ts)} video(s) without timestamps -> hb_no_timestamps.json")
