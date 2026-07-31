@@ -97,6 +97,40 @@ def restore_qv_bias(model: VideoMAEModel, model_id: str) -> int:
     return n
 
 
+def load_encoder(device: str):
+    """(processor, model) ready for inference. Shared with predict.py.
+
+    Inference MUST build the encoder exactly as training did -- a processor with
+    different normalization, or a model missing the q/v biases, produces
+    embeddings in a different space than the cached ones the head was fit on. The
+    head would still return confident-looking probabilities. So this lives in one
+    place and both callers use it.
+    """
+    processor = VideoMAEImageProcessor.from_pretrained(MODEL_ID)
+    model = VideoMAEModel.from_pretrained(
+        MODEL_ID,
+        dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+    )
+    restored = restore_qv_bias(model, MODEL_ID)
+    expected = 2 * len(model.encoder.layer)
+    if restored != expected:
+        sys.exit(f"restored {restored} q/v bias tensors, expected {expected} -- "
+                 f"checkpoint layout changed; embeddings would be silently wrong")
+    return processor, model.to(device).eval(), restored
+
+
+def embed(frames: np.ndarray, processor, model, device: str) -> np.ndarray:
+    """Frames -> one pooled embedding. Shared so training and inference agree."""
+    inputs = processor(list(frames), return_tensors="pt").to(device)
+    if device == "cuda":
+        inputs = {k: v.to(torch.bfloat16) if v.is_floating_point() else v
+                  for k, v in inputs.items()}
+    with torch.inference_mode():
+        hidden = model(**inputs).last_hidden_state
+        # Mean-pool patch tokens: VideoMAE has no CLS token to lean on.
+        return hidden.mean(dim=1).squeeze(0).float().cpu().numpy()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data", type=Path,
@@ -112,22 +146,9 @@ def main() -> None:
                  f"(expected data/<category>/<clip>.mp4)")
 
     print(f"loading {MODEL_ID} on {args.device} ...")
-    # Name both classes explicitly. AutoVideoProcessor cannot infer a type from a
-    # config that predates the video-processor split, and AutoModel would need
-    # trust_remote_code for repos that ship custom architectures.
-    processor = VideoMAEImageProcessor.from_pretrained(MODEL_ID)
-    model = VideoMAEModel.from_pretrained(
-        MODEL_ID,
-        dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
-    )
-    restored = restore_qv_bias(model, MODEL_ID)
-    expected = 2 * len(model.encoder.layer)
-    if restored != expected:
-        sys.exit(f"restored {restored} q/v bias tensors, expected {expected} -- "
-                 f"checkpoint layout changed; embeddings would be silently wrong")
+    processor, model, restored = load_encoder(args.device)
     print(f"  restored {restored} q/v attention biases "
           f"(transformers renamed them; they load as zeros otherwise)")
-    model = model.to(args.device).eval()
 
     done = skipped = failed = 0
     dim = None
@@ -144,15 +165,7 @@ def main() -> None:
             failed += 1
             continue
 
-        inputs = processor(list(frames), return_tensors="pt").to(args.device)
-        if args.device == "cuda":
-            inputs = {k: v.to(torch.bfloat16) if v.is_floating_point() else v
-                      for k, v in inputs.items()}
-
-        with torch.inference_mode():
-            hidden = model(**inputs).last_hidden_state
-            # Mean-pool patch tokens: VideoMAE has no CLS token to lean on.
-            emb = hidden.mean(dim=1).squeeze(0).float().cpu().numpy()
+        emb = embed(frames, processor, model, args.device)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         np.save(out, emb)

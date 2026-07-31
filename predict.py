@@ -13,9 +13,8 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
-from transformers import AutoModel, AutoVideoProcessor
 
-from extract_features import MODEL_ID, decode_frames
+from extract_features import decode_frames, embed, load_encoder
 from fetch_playlist import FORMAT
 
 
@@ -59,19 +58,10 @@ def main() -> None:
         if frames is None:
             sys.exit(f"could not decode {path}")
 
-        processor = AutoVideoProcessor.from_pretrained(MODEL_ID)
-        model = AutoModel.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
-        ).to(args.device).eval()
-
-        inputs = processor(list(frames), return_tensors="pt").to(args.device)
-        if args.device == "cuda":
-            inputs = {k: v.to(torch.bfloat16) if v.is_floating_point() else v
-                      for k, v in inputs.items()}
-        with torch.inference_mode():
-            emb = model(**inputs).last_hidden_state.mean(1).squeeze(0)
-        emb = emb.float().cpu().numpy()
+        # Same loader and same pooling as extract_features.py used to build the
+        # cache the head was trained on -- see load_encoder() for why that matters.
+        processor, model, _ = load_encoder(args.device)
+        emb = embed(frames, processor, model, args.device)
 
     if emb.shape[-1] != bundle["dim"]:
         sys.exit(f"embedding dim {emb.shape[-1]} != model's {bundle['dim']}")
