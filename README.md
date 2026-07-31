@@ -58,19 +58,33 @@ winget install Gyan.FFmpeg        # then reopen the shell so PATH refreshes
 ffmpeg -version                    # must print a version
 ```
 
+**tesseract** on PATH, for the Herbert pipeline only (`winget install
+UB-Mannheim.TesseractOCR`).
+
 ## Setup
 
 ```bash
-cd ~/video-categorizer
+cd ~/kimarite-checker
 py -3.12 -m venv .venv
 source .venv/Scripts/activate      # Git Bash;  .venv\Scripts\activate on cmd
 
-# torch from the CUDA index -- plain `pip install torch` is CPU-only.
+# CUDA build if you have the VRAM and the bandwidth (2.5 GB):
 pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
+# CPU-only is ~200 MB and enough for a few hundred clips -- the encoder is frozen
+# and each clip is embedded exactly once, so the GPU saves minutes, not hours:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-python -c "import torch; print(torch.cuda.is_available())"   # expect True
+pip install -r requirements.txt
+python -c "import torch; print(torch.cuda.is_available())"
 ```
+
+Then `cp env.sh.example env.sh` and `source ./env.sh` **in every new shell** --
+it puts ffmpeg/yt-dlp/tesseract and `.venv` on PATH.
+
+> Make sure `python` is the venv's. If it resolves to a system Python while pip
+> installs into `.venv`, scripts that use only stdlib run fine and hide the split,
+> and then `extract_features.py` dies on `import torch` with the wheel installed.
+> `env.sh` puts `.venv/Scripts` first and warns if it isn't there.
 
 ## Use
 
@@ -126,6 +140,40 @@ python predict.py bout.mp4
 python predict.py https://youtu.be/XXXXXXXXXXX
 ```
 
+## Second source: the Herbert pipeline (`hb_*.py`)
+
+A different channel, a different broadcast, and **4.6x more footage** (110 videos,
+64 h). It needs its own stages 0-1 because both NHK assumptions break: the caption
+is *prose containing the winner's name* (`KINBOZAN WINS BY OSHIDASHI`), so its
+pixel width varies per bout and clustering cannot group it; and the bout
+boundaries are hand-written in the video descriptions, so no onset detection is
+needed. See `HERBERT.md` for the full assessment.
+
+```bash
+python hb_manifest.py                     # descriptions -> hb_bouts.csv (1647 bouts)
+python hb_label.py --probe <video-id>     # check WIN_BOX before a long run
+python hb_label.py --resume               # OCR -> data_hb/<kimarite>/*.mp4
+```
+
+From there it rejoins the NHK path: `extract_features.py --data data_hb` etc.
+
+**Status as of the last session.** Manifest complete: **1647 bouts from 82
+videos** (of 110; 27 have no parseable timestamps, 1 was a cross-playlist
+duplicate). A 28-bout spot check across **5 tournaments and both resolutions**
+(854x480 and 640x360) labeled 24/28 -- so `WIN_BOX`, calibrated on a single Haru
+2026 video, transfers. **14% miss rate**, consistent across both checks.
+
+The pilot label pass over 270 bouts was **started and stopped at 12** because
+video decode + OCR is sustained-100%-CPU work and the laptop was too loud for it.
+`hb_labels.csv` holds those 12; `--resume` skips them. Nothing else is blocking.
+
+**Cost, measured:** ~20 s/bout single-process, so 270 bouts ~1.5 h and all 1647
+~9 h. Do not parallelize on a laptop -- see the note in `extract_strips()`.
+
+**If you clone this somewhere new**, the only local state worth carrying is
+`hb_labels.csv`. Videos re-download in ~10 min at 7 MB/s, and `hb_bouts.csv`
+rebuilds from the descriptions.
+
 ## What to expect
 
 **Don't attempt 82-way classification.** The distribution is brutally long-tailed:
@@ -149,7 +197,10 @@ present in your data):
 
 **Non-techniques are excluded.** The 7 *higi* (`koshikudake`, `tsukite`, `fusen`,
 ...) mean the loser lost unaided -- there is no causal motion to learn. `fusen`
-means the opponent never appeared, so no bout was fought at all.
+means the opponent never appeared, so no bout was fought at all. This is enforced
+in the labelers via `kimarite.is_technique()`, not just documented: the spot check
+produced a real `fusen` read, and without the check it would have written 6 s of
+an empty dohyo into the training set under a technique label.
 
 **Judge by the grouped CV number**, not the held-out block.
 
