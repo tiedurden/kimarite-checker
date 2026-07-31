@@ -92,12 +92,15 @@ def playlist_videos(pl: str) -> list[tuple[str, int]]:
 
 def bouts_from_description(vid: str) -> list[dict]:
     """Parse '<ts> - A vs B' lines out of one video's description."""
+    # Decode as UTF-8 explicitly rather than via text=True, which uses the console
+    # locale (cp1252 here). Descriptions carry Japanese shikona and emoji, so a
+    # locale decode can raise UnicodeDecodeError mid-run and lose the whole scrape.
     r = subprocess.run(
         ["yt-dlp", "--no-playlist", "--skip-download", "--print", "%(description)s",
          f"https://www.youtube.com/watch?v={vid}"],
-        capture_output=True, text=True)
+        capture_output=True)
     found = []
-    for line in r.stdout.splitlines():
+    for line in (r.stdout or b"").decode("utf-8", errors="replace").splitlines():
         m = TS_RE.match(line)
         if m:
             found.append({

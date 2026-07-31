@@ -52,7 +52,11 @@ MASK_MARGIN = 0.02
 # The caption shows up during the replay, i.e. AFTER the bout. Search the last
 # SEARCH_TAIL seconds of each manifest window at SEARCH_FPS.
 SEARCH_TAIL = 45.0
-SEARCH_FPS = 1.0   # caption holds ~7s, so ~7 looks at it -> enough for MIN_VOTES
+# The caption holds ~7s but is only cleanly legible for part of that (it fades in
+# and out, and the frames underneath change). At 1 fps a real caption produced ONE
+# clean read plus two misreads, which MIN_VOTES=2 then rejected -- 7 of 21 bouts
+# lost that way. At 3 fps the legible stretch yields several agreeing reads.
+SEARCH_FPS = 3.0
 
 CLIP_LEN = 6.0   # bout footage kept per sample
 CLIP_BACK = 4.0  # clip ends this many seconds BEFORE the caption's first frame
@@ -61,12 +65,37 @@ CLIP_BACK = 4.0  # clip ends this many seconds BEFORE the caption's first frame
 # tacks on a garbage glyph or two from the line below. So: spaces optional, and
 # take the technique as a greedy run that kimarite.normalize() then has to accept
 # -- its fuzzy +/-2-char match absorbs the trailing noise ("OSHIDASHINe" -> oshidashi).
-WIN_RE = re.compile(r"([A-Z][A-Za-z]{2,})\s*WIN5?S?\s*BY\s*([A-Za-z]+)", re.IGNORECASE)
+#
+# The technique class allows digits and punctuation because tesseract substitutes
+# lookalike glyphs INSIDE the word: "TSUKIOTOSHI" came back as "1SUKIOTOSH!"
+# (T->1, I->!). A letters-only class rejected the line outright, which is how 7 of
+# 21 bouts were lost. OCR_FIXES undoes the substitution before normalize() sees it.
+# The (?:A|4)? after BY absorbs the artefact seen when the space is dropped:
+# "WINS BY TSUKIOTOSHI" -> "WINSBYASUKIOTOSHI", where the missing space renders as
+# a spurious A/4 glued to the front of the technique.
+WIN_RE = re.compile(
+    r"([A-Z0-9][A-Za-z0-9]{2,})\s*WIN5?S?\s*[8B]Y\s*(?:[A4](?=[A-Z]{4}))?"
+    r"([A-Za-z0-9!|\[\]/\\]+)",
+    re.IGNORECASE)
 
-# Distinct OCR reads that must agree before a label is accepted. The caption holds
-# for ~7s, so at SEARCH_FPS we get several looks at it; requiring agreement kills
-# one-off misreads that happen to fuzzy-match a real (wrong) technique name.
+# Glyph confusions observed in real output at 854x480. Applied to the technique
+# token only -- never to the winner's name, where a wrong letter is harmless but a
+# wrong technique is a corrupt label.
+OCR_FIXES = str.maketrans({
+    "1": "I", "!": "I", "|": "I", "[": "I", "]": "I", "/": "I", "\\": "I",
+    "0": "O", "5": "S", "8": "B", "6": "G", "2": "Z",
+})
+
+# Distinct OCR reads that must agree before a label is accepted. Requiring
+# agreement is not paranoia: at 1 fps this caption read as "1SUKIOTOSH!"
+# (-> tsukiotoshi) once and "TSURIOTOSHI" (-> tsuriotoshi) twice. Those are two
+# DIFFERENT real techniques one letter apart (k vs r), so a first-past-the-post
+# rule takes whichever crosses the line first and can be confidently wrong.
+# So: scan the WHOLE window, then take the plurality winner.
 MIN_VOTES = 2
+# ...and require the winner to beat the runner-up by this margin, else it's a
+# coin flip between two lookalike techniques and we'd rather record a miss.
+VOTE_MARGIN = 2
 
 
 def box_px(box, w: int, h: int) -> tuple[int, int, int, int]:
@@ -102,20 +131,54 @@ def ocr_strip(path: Path, t: float, w: int, h: int, tmp: Path) -> str:
         capture_output=True)
     if not png.exists():
         return ""
+    # Decode explicitly, errors="replace". OCR on broadcast video regularly emits
+    # bytes that are not valid in the console's locale encoding (cp1252 on this
+    # box), and text=True decodes with that locale -- so a single stray 0x9d from
+    # a noisy frame killed the whole run at bout 5 of 21. The garbage frames are
+    # exactly the ones we expect to fail the regex anyway; they must not be fatal.
     r = subprocess.run(
         ["tesseract", str(png), "stdout", "--psm", "7", "-l", "eng"],
-        capture_output=True, text=True)
-    return r.stdout.strip()
+        capture_output=True)
+    return (r.stdout or b"").decode("utf-8", errors="replace").strip()
+
+
+def normalize_ocr(raw: str) -> str | None:
+    """kimarite.normalize(), but tolerant of OCR glyph substitution.
+
+    Tries the raw token first (so a clean read costs nothing), then the
+    de-substituted form. "1" is ambiguous -- it stands in for both I and T in this
+    font ("1SUKIOTOSH!" is TSUKIOTOSHI, but a medial 1 is usually I) -- so both
+    readings are attempted and the first that hits the closed vocabulary wins.
+    Anything that matches no real technique still returns None: guessing is worse
+    than missing, because a wrong label silently poisons training.
+    """
+    fixed = raw.translate(OCR_FIXES)
+    cands = [raw, fixed, fixed.replace("I", "T", 1)]
+    # Tesseract also confuses J/D/O for O in the middle of a word ("TSUKIOJOSHI",
+    # "TSUKIOJDSHI" for TSUKIOTOSHI) and prepends a stray letter ("FSUKIOTOSHI",
+    # "ASUKIOTOSHI"). normalize()'s +/-2 tolerance covers ONE such error, not two,
+    # so try the medial-consonant repair and a leading-char drop as well.
+    cands.append(re.sub(r"(?<=[AEIOU])[JD](?=[AEIOU])", "T", fixed))
+    cands.append(fixed[1:])
+    for cand in cands:
+        if hit := kimarite.normalize(cand):
+            return hit
+    return None
 
 
 def find_caption(path: Path, start: float, end: float, w: int, h: int,
                  tmp: Path) -> tuple[str, str, float, int] | None:
-    """Scan the window tail for 'X WINS BY Y'.
+    """Scan the window tail for 'X WINS BY Y' and return the plurality reading.
 
-    Returns (winner, kimarite, first_seen_t, votes) once MIN_VOTES independent
-    frames agree on the technique, else None. Voting matters because a single
-    misread can still fuzzy-match a REAL but WRONG technique -- and a silently
-    wrong label is worse than a miss, which at least shows up in the miss count.
+    Returns (winner, kimarite, first_seen_t, votes), or None if nothing reached
+    MIN_VOTES / VOTE_MARGIN. The whole window is scanned before deciding, rather
+    than returning on the first technique to reach MIN_VOTES: two techniques one
+    letter apart can both appear among the reads, and whichever got there first
+    would win an early-exit race regardless of which is actually on screen.
+
+    A returned miss is a deliberate outcome, not a failure -- it shows up in the
+    miss count and can be relabelled by hand. A wrong label cannot be spotted at
+    all once it is a directory name.
     """
     t = max(start, end - SEARCH_TAIL)
     step = 1.0 / SEARCH_FPS
@@ -125,15 +188,20 @@ def find_caption(path: Path, start: float, end: float, w: int, h: int,
     while t < end:
         text = ocr_strip(path, t, w, h, tmp)
         if m := WIN_RE.search(text):
-            canon = kimarite.normalize(m.group(2))
+            canon = normalize_ocr(m.group(2))
             if canon:
                 votes[canon] += 1
                 winners.setdefault(canon, m.group(1).title())
                 first_t.setdefault(canon, t)
-                if votes[canon] >= MIN_VOTES:
-                    return winners[canon], canon, first_t[canon], votes[canon]
         t += step
-    return None
+    if not votes:
+        return None
+    ranked = votes.most_common()
+    top, n = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0
+    if n < MIN_VOTES or n - runner_up < VOTE_MARGIN:
+        return None
+    return winners[top], top, first_t[top], n
 
 
 def mask_filter(w: int, h: int) -> str:
