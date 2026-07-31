@@ -70,11 +70,19 @@ def main() -> None:
         import kimarite
         y = np.array([kimarite.coarse(v) or "other" for v in y])
         print("training on official families (--coarse)")
-    elif args.min_class:
+
+    # Fold AFTER coarsening, and for both modes. This used to be an `elif`, so
+    # --coarse silently ignored --min-class even though the two are documented as
+    # independent -- and folding matters MORE here: the families are long-tailed
+    # too (kakete and hinerite turned up with 1 clip each), and one singleton class
+    # is enough to disable the grouped-CV block entirely, since n_folds is bounded
+    # by the smallest class. That silently removed the most trustworthy number the
+    # script reports.
+    if args.min_class:
         # Long tail: ~5 techniques dominate, dozens appear once. A class with 3
         # examples cannot be learned and its presence only adds label noise.
         c0 = Counter(y)
-        rare = {k for k, n in c0.items() if n < args.min_class}
+        rare = {k for k, n in c0.items() if n < args.min_class and k != "other"}
         if rare:
             y = np.array(["other" if v in rare else v for v in y])
             print(f"folded {len(rare)} class(es) with <{args.min_class} clips "
