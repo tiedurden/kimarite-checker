@@ -134,10 +134,25 @@ def main() -> None:
         print(f"excluding NHK-overlapping tournaments: {sorted(OVERLAPS_NHK)}\n")
 
     rows, no_ts, over = [], [], {}
+    # A video can sit in TWO playlists: ykaQBUI-T6w is a Nagoya 2026 upload
+    # (2026-07-13) that Herbert also filed into his Nagoya 2025 playlist. Without
+    # this guard it yields duplicate <video>__<n> keys, and hb_label.py names
+    # clips by exactly that key -- so the second copy would silently overwrite
+    # the first. Worse, the dupe carried a nagoya2025 label while actually being
+    # nagoya2026, an NHK-overlapping tournament: --exclude-nhk-overlap would have
+    # dropped one copy and kept the other, quietly leaking held-out footage into
+    # training. First playlist wins, matching PLAYLISTS_HB order (2026 first).
+    seen_vids: set[str] = set()
+    dupes: list[tuple[str, str]] = []
     for name, pl in sets.items():
         vids = playlist_videos(pl)
         print(f"=== {name} ({len(vids)} videos)")
         for vid, dur in vids:
+            if vid in seen_vids:
+                dupes.append((name, vid))
+                print(f"  {vid}  already seen in an earlier playlist -- skipped")
+                continue
+            seen_vids.add(vid)
             bouts = bouts_from_description(vid)
             if not bouts:
                 no_ts.append((name, vid))
@@ -180,6 +195,9 @@ def main() -> None:
     print(f"\n{len(rows)} bouts -> {args.out}")
     for t, n in sorted(by_t.items()):
         print(f"  {t:<14} {n:>4}")
+    if dupes:
+        print(f"\n{len(dupes)} video(s) skipped as cross-playlist duplicates: "
+              + ", ".join(f"{v} (2nd seen under {t})" for t, v in dupes))
     if over:
         print(f"\nclamped {sum(over.values())} over-long window(s) to {MAX_BOUT}s "
               f"(truncated description / missing timestamp): "
