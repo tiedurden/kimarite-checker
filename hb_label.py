@@ -116,21 +116,39 @@ def probe_dims(path: Path) -> tuple[int, int]:
         sys.exit(f"ffprobe failed on {path}: {r.stderr.strip()}")
 
 
-def ocr_strip(path: Path, t: float, w: int, h: int, tmp: Path) -> str:
-    """Upscale + binarize the caption strip, then OCR it."""
+def extract_strips(path: Path, start: float, end: float, w: int, h: int,
+                   tmp: Path) -> list[Path]:
+    """Decode the search window ONCE and write every caption strip as a PNG.
+
+    The original version spawned one ffmpeg per sampled frame: at SEARCH_FPS=3
+    over a 45s tail that is 135 process launches per bout, each re-opening the
+    container and seeking. Measured 43s/bout, and running 6 of those in parallel
+    pinned the machine (12 concurrent transcode/OCR processes, laptop fans at
+    full tilt). One sequential decode with fps= does the same sampling in a
+    single process.
+
+    Frames land as strip_0001.png, strip_0002.png, ... in timestamp order, so
+    index i corresponds to time start + i/SEARCH_FPS.
+    """
     cw, ch, cx, cy = box_px(WIN_BOX, w, h)
-    png = tmp / "ocr.png"
+    for old in tmp.glob("strip_*.png"):
+        old.unlink()
+    # -ss BEFORE -i so ffmpeg seeks rather than decoding from frame 0.
     # 4x lanczos + grayscale + high contrast: tesseract is far more reliable on
     # large clean glyphs than on 480p broadcast text. lanczos beat nearest here
     # (nearest kept the JPEG mosquito noise as hard edges and OCR read them).
     subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", str(path),
-         "-vf", f"crop={cw}:{ch}:{cx}:{cy},scale=iw*4:ih*4:flags=lanczos,"
-                f"format=gray,eq=contrast=1.8",
-         "-frames:v", "1", str(png)],
+        ["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}",
+         "-t", f"{end - start:.2f}", "-i", str(path),
+         "-vf", f"fps={SEARCH_FPS},crop={cw}:{ch}:{cx}:{cy},"
+                f"scale=iw*4:ih*4:flags=lanczos,format=gray,eq=contrast=1.8",
+         str(tmp / "strip_%04d.png")],
         capture_output=True)
-    if not png.exists():
-        return ""
+    return sorted(tmp.glob("strip_*.png"))
+
+
+def ocr_png(png: Path) -> str:
+    """OCR one already-extracted strip."""
     # Decode explicitly, errors="replace". OCR on broadcast video regularly emits
     # bytes that are not valid in the console's locale encoding (cp1252 on this
     # box), and text=True decodes with that locale -- so a single stray 0x9d from
@@ -180,20 +198,20 @@ def find_caption(path: Path, start: float, end: float, w: int, h: int,
     miss count and can be relabelled by hand. A wrong label cannot be spotted at
     all once it is a directory name.
     """
-    t = max(start, end - SEARCH_TAIL)
+    t0 = max(start, end - SEARCH_TAIL)
     step = 1.0 / SEARCH_FPS
     votes: Counter = Counter()
     winners: dict[str, str] = {}
     first_t: dict[str, float] = {}
-    while t < end:
-        text = ocr_strip(path, t, w, h, tmp)
+    for i, png in enumerate(extract_strips(path, t0, end, w, h, tmp)):
+        text = ocr_png(png)
         if m := WIN_RE.search(text):
             canon = normalize_ocr(m.group(2))
             if canon:
                 votes[canon] += 1
                 winners.setdefault(canon, m.group(1).title())
-                first_t.setdefault(canon, t)
-        t += step
+                # fps= emits frames evenly from t0, so index maps back to time.
+                first_t.setdefault(canon, t0 + i * step)
     if not votes:
         return None
     ranked = votes.most_common()
@@ -239,6 +257,14 @@ def main() -> None:
     ap.add_argument("--data", default="data_hb", type=Path)
     ap.add_argument("--out", default="hb_labels.csv", type=Path)
     ap.add_argument("--limit", type=int, help="stop after N bouts (for testing)")
+    # Each worker needs its OWN scratch dir. ocr_strip() always writes ocr.png, so
+    # parallel workers sharing one dir would overwrite each other's frame between
+    # the ffmpeg write and the tesseract read -- silently labeling bouts with
+    # another worker's caption. Shard by video and give each shard a distinct --tmp.
+    ap.add_argument("--tmp", default="crops/_tmp", type=Path,
+                    help="scratch dir for OCR frames (must be unique per process)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip bouts already present in --out (append instead)")
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -261,12 +287,39 @@ def main() -> None:
     if args.limit:
         rows = rows[: args.limit]
 
-    tmp = Path("crops/_tmp")
+    tmp = args.tmp
     tmp.mkdir(parents=True, exist_ok=True)
     dims: dict[str, tuple[int, int]] = {}
 
-    out_rows, hits, misses = [], Counter(), []
+    # Resume: a bout whose row is already in --out has been done, so skip the ~40s
+    # of OCR. Keyed on video+n, the same key the clip filename uses. This run was
+    # killed at 11 clips once (machine load) and every label row was lost, because
+    # results were only written at the very end.
+    done: set[tuple[str, str]] = set()
+    prev_rows: list[dict] = []
+    if args.resume and args.out.exists():
+        prev_rows = list(csv.DictReader(args.out.open(encoding="utf-8")))
+        done = {(p["video"], p["n"]) for p in prev_rows}
+        if done:
+            print(f"resuming: {len(done)} bout(s) already in {args.out}")
+
+    out_rows, hits, misses, higi = list(prev_rows), Counter(), [], Counter()
+    for p in prev_rows:
+        hits[p["kimarite"]] += 1
+
+    # Append-and-flush per bout so a kill loses at most the bout in flight.
+    fields = list(rows[0]) + ["kimarite", "winner", "votes", "caption_t", "clip"]
+    new_file = not (args.resume and args.out.exists() and prev_rows)
+    sink = args.out.open("w" if new_file else "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(sink, fieldnames=fields)
+    if new_file:
+        writer.writeheader()
+        writer.writerows(prev_rows)
+        sink.flush()
+
     for i, r in enumerate(rows, 1):
+        if (r["video"], r["n"]) in done:
+            continue
         vids = list(args.raw.glob(f"*{r['video']}*.mp4"))
         if not vids:
             misses.append((r["video"], r["n"], "video not downloaded"))
@@ -283,6 +336,19 @@ def main() -> None:
             print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  MISS")
             continue
         winner, canon, t_cap, votes = found
+
+        # Higi (non-techniques) are correct OCR reads that must not become training
+        # samples. Some have no bout footage at all -- "fusen" is a forfeit, so the
+        # clip is 6s of an empty dohyo -- and the rest (isamiashi, koshikudake,
+        # tsukite...) are self-inflicted losses where no technique was applied. Both
+        # kinds are noise in a technique classifier's input. Counted, not silently
+        # dropped, so the tally still reconciles against the manifest.
+        if not kimarite.is_technique(canon):
+            higi[canon] += 1
+            print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  {canon:<16} "
+                  f"({winner}, {votes} votes)  SKIP -- not a technique")
+            continue
+
         hits[canon] += 1
         print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  {canon:<16} "
               f"({winner}, {votes} votes)")
@@ -297,18 +363,21 @@ def main() -> None:
              "-i", str(path), "-t", f"{clip_end-clip_start:.2f}", "-an",
              "-vf", mask_filter(w, h), "-c:v", "libx264", "-preset", "veryfast",
              str(dest)], capture_output=True).returncode == 0
-        out_rows.append({**r, "kimarite": canon, "winner": winner, "votes": votes,
-                         "caption_t": round(t_cap, 2), "clip": str(dest) if ok else ""})
+        row = {**r, "kimarite": canon, "winner": winner, "votes": votes,
+               "caption_t": round(t_cap, 2), "clip": str(dest) if ok else ""}
+        out_rows.append(row)
+        writer.writerow(row)
+        sink.flush()   # survive a kill: at most the in-flight bout is lost
 
-    with args.out.open("w", newline="", encoding="utf-8") as f:
-        if out_rows:
-            wr = csv.DictWriter(f, fieldnames=list(out_rows[0]))
-            wr.writeheader()
-            wr.writerows(out_rows)
+    sink.close()
 
-    print(f"\n{sum(hits.values())} labeled, {len(misses)} missed -> {args.out}")
+    print(f"\n{sum(hits.values())} labeled, {len(misses)} missed, "
+          f"{sum(higi.values())} non-technique -> {args.out}")
     for k, n in hits.most_common(20):
         print(f"  {k:<24} {n:>4}")
+    if higi:
+        print("\nskipped as non-techniques (higi -- no technique was applied): "
+              + ", ".join(f"{k} x{n}" for k, n in higi.most_common()))
     if misses:
         print(f"\nfirst misses: {misses[:5]}")
         rate = len(misses) / max(1, len(rows))
