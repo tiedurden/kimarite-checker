@@ -17,6 +17,10 @@ hb_bouts.csv
 hb_labels.csv
 hb_no_timestamps.json
 
+# Scratch files from interactive runs: shard CSVs, download/label logs, ad-hoc
+# video-id lists. All named with a leading underscore so one rule catches them.
+_*
+
 # Python
 .venv/
 __pycache__/
