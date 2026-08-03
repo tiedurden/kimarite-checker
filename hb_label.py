@@ -28,6 +28,7 @@ from collections import Counter
 from pathlib import Path
 
 import kimarite
+from hb_window import cut_clip, find_bout_window, probe_window
 
 # CALIBRATED on Haru 2026 Day 1 (nnSWd2TFUVo, 854x480) by OCR bisection, NOT by
 # eyeballing a tile: the win line occupies y 350-384, x 0-380. Verified to read
@@ -58,8 +59,11 @@ SEARCH_TAIL = 45.0
 # lost that way. At 3 fps the legible stretch yields several agreeing reads.
 SEARCH_FPS = 3.0
 
-CLIP_LEN = 6.0   # bout footage kept per sample
-CLIP_BACK = 4.0  # clip ends this many seconds BEFORE the caption's first frame
+# Clip bounds come from hb_window.find_bout_window(), which anchors on the video
+# (pre-bout banner -> first scene cut after the charge). There is deliberately no
+# CLIP_LEN/CLIP_BACK any more: a fixed offset from the caption put 59% of the first
+# dataset entirely outside the bout, because the caption fires during the replay
+# 13-91s after the charge. See hb_window's module docstring.
 
 # OCR at 480p intermittently drops inter-word spaces ("WINSBYOSHIDASHI") and
 # tacks on a garbage glyph or two from the line below. So: spaces optional, and
@@ -252,6 +256,10 @@ def probe(path: Path, out: Path, start: float = 200, span: float = 80) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", help="video id in raw/ to dump caption crops for")
+    ap.add_argument("--probe-window", metavar="VIDEO_ID",
+                    help="dump a contact sheet of DETECTED BOUT WINDOWS for a video "
+                         "already present in --out; every row should read "
+                         "crouch -> charge -> grapple -> finish")
     ap.add_argument("--bouts", default="hb_bouts.csv", type=Path)
     ap.add_argument("--raw", default="raw", type=Path)
     ap.add_argument("--data", default="data_hb", type=Path)
@@ -276,6 +284,34 @@ def main() -> None:
         if not cands:
             sys.exit(f"no video matching {args.probe} in {args.raw}/")
         return probe(cands[0], Path("crops/_probe"))
+
+    if args.probe_window:
+        # Needs caption_t, which only exists once a bout has been OCR'd -- so this
+        # probes an already-labelled video rather than a fresh one. That is the
+        # right order anyway: OCR first (cheap to check via --probe), then confirm
+        # the window the labels will be paired with.
+        cands = list(args.raw.glob(f"*{args.probe_window}*.mp4"))
+        if not cands:
+            sys.exit(f"no video matching {args.probe_window} in {args.raw}/")
+        if not args.out.exists():
+            sys.exit(f"{args.out} not found -- label some bouts first, "
+                     f"--probe-window needs their caption times")
+        labeled = [r for r in csv.DictReader(args.out.open(encoding="utf-8"))
+                   if args.probe_window in r["video"] and r.get("caption_t")]
+        if not labeled:
+            sys.exit(f"no labelled bouts for {args.probe_window} in {args.out}")
+        out_dir = Path("crops/_probe")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        png = out_dir / f"hb_window_{args.probe_window}.png"
+        # Spread the sample across the video so an anchor that only works early
+        # (different graphics in the makuuchi vs juryo segments) shows up.
+        step = max(1, len(labeled) // 6)
+        print(probe_window(cands[0], labeled[::step][:6], png))
+        print(f"\nwrote {png}\nEvery row should span the bout: crouch, charge, "
+              f"grapple, finish, wrestlers\non the dohyo through the middle. Rows of "
+              f"crowd shots or close-ups mean the\nanchors need recalibrating for "
+              f"this source (see hb_window.py).")
+        return
 
     if subprocess.run(["which", "tesseract"], capture_output=True).returncode != 0:
         sys.exit("tesseract not on PATH -- winget install UB-Mannheim.TesseractOCR\n"
@@ -304,12 +340,21 @@ def main() -> None:
             print(f"resuming: {len(done)} bout(s) already in {args.out}")
 
     out_rows, hits, misses, higi = list(prev_rows), Counter(), [], Counter()
+    window_misses: list[tuple[str, str, str]] = []
     for p in prev_rows:
         hits[p["kimarite"]] += 1
 
     # Append-and-flush per bout so a kill loses at most the bout in flight.
-    fields = list(rows[0]) + ["kimarite", "winner", "votes", "caption_t", "clip"]
-    new_file = not (args.resume and args.out.exists() and prev_rows)
+    fields = list(rows[0]) + ["kimarite", "winner", "votes", "caption_t", "clip",
+                              "bout_start", "bout_end"]
+    # Appending to a CSV whose header predates bout_start/bout_end would write the
+    # new column order under the old header, silently shifting every value. Rewrite
+    # the file instead when the schema has changed.
+    stale_header = bool(prev_rows) and set(prev_rows[0]) != set(fields)
+    new_file = stale_header or not (args.resume and args.out.exists() and prev_rows)
+    if stale_header:
+        print(f"{args.out} predates the bout_start/bout_end columns -- rewriting "
+              f"its header (old rows keep blank bout bounds)")
     sink = args.out.open("w" if new_file else "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(sink, fieldnames=fields)
     if new_file:
@@ -349,29 +394,37 @@ def main() -> None:
                   f"({winner}, {votes} votes)  SKIP -- not a technique")
             continue
 
+        # Locate the bout in the video. A bout whose window cannot be found is a
+        # MISS, not a clip cut on a guess: the label would be right and the footage
+        # wrong, which is undetectable downstream -- it just holds the score at
+        # chance. Counted separately from OCR misses so the two failure modes stay
+        # distinguishable (bad graphics vs bad manifest window).
+        got = find_bout_window(path, start, t_cap)
+        if isinstance(got, str):
+            window_misses.append((r["video"], r["n"], got))
+            print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  {canon:<16} "
+                  f"({winner}, {votes} votes)  NO WINDOW -- {got}")
+            continue
+        clip_start, clip_end = got
+
         hits[canon] += 1
         print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  {canon:<16} "
-              f"({winner}, {votes} votes)")
+              f"({winner}, {votes} votes)  bout {clip_start:.1f}-{clip_end:.1f} "
+              f"({clip_end - clip_start:.1f}s)")
 
-        # Clip ends before the caption appears; masking covers the rest.
-        clip_end = max(start + 1.0, t_cap - CLIP_BACK)
-        clip_start = max(start, clip_end - CLIP_LEN)
         dest = args.data / canon / f"{r['video']}__{int(r['n']):02d}.mp4"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        ok = subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-ss", f"{clip_start:.2f}",
-             "-i", str(path), "-t", f"{clip_end-clip_start:.2f}", "-an",
-             "-vf", mask_filter(w, h), "-c:v", "libx264", "-preset", "veryfast",
-             str(dest)], capture_output=True).returncode == 0
+        ok = cut_clip(path, dest, clip_start, clip_end, mask_filter(w, h))
         row = {**r, "kimarite": canon, "winner": winner, "votes": votes,
-               "caption_t": round(t_cap, 2), "clip": str(dest) if ok else ""}
+               "caption_t": round(t_cap, 2), "clip": str(dest) if ok else "",
+               "bout_start": round(clip_start, 2), "bout_end": round(clip_end, 2)}
         out_rows.append(row)
         writer.writerow(row)
         sink.flush()   # survive a kill: at most the in-flight bout is lost
 
     sink.close()
 
-    print(f"\n{sum(hits.values())} labeled, {len(misses)} missed, "
+    print(f"\n{sum(hits.values())} labeled, {len(misses)} OCR missed, "
+          f"{len(window_misses)} no bout window, "
           f"{sum(higi.values())} non-technique -> {args.out}")
     for k, n in hits.most_common(20):
         print(f"  {k:<24} {n:>4}")
@@ -379,11 +432,21 @@ def main() -> None:
         print("\nskipped as non-techniques (higi -- no technique was applied): "
               + ", ".join(f"{k} x{n}" for k, n in higi.most_common()))
     if misses:
-        print(f"\nfirst misses: {misses[:5]}")
+        print(f"\nfirst OCR misses: {misses[:5]}")
         rate = len(misses) / max(1, len(rows))
         if rate > 0.2:
             print(f"MISS RATE {rate:.0%} -- re-check WIN_BOX with --probe, or widen\n"
                   f"SEARCH_TAIL (caption may fall outside the searched window tail).")
+    if window_misses:
+        print(f"\nread the caption but could not locate the bout "
+              f"({len(window_misses)}):")
+        for reason, n in Counter(r for _, _, r in window_misses).most_common():
+            print(f"  {n:>4}x {reason}")
+        rate = len(window_misses) / max(1, len(rows))
+        if rate > 0.2:
+            print(f"WINDOW MISS RATE {rate:.0%} -- check the anchors by eye with\n"
+                  f"  python hb_label.py --probe-window <video-id>\n"
+                  f"The banner anchor is channel-specific, like WIN_BOX.")
 
 
 if __name__ == "__main__":

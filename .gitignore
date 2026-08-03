@@ -15,6 +15,7 @@ models/
 # Committing them would also publish a scrape of another channel's metadata.
 hb_bouts.csv
 hb_labels.csv
+hb_labels.csv.bak
 hb_no_timestamps.json
 
 # Scratch files from interactive runs: shard CSVs, download/label logs, ad-hoc

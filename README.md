@@ -32,6 +32,45 @@ Why this shape: the encoder is the expensive part and never changes, so it runs
 once and its output is cached. All iteration -- label granularity, class merging,
 hyperparameters -- happens in `train_head.py`, which re-trains in seconds.
 
+## The trap that actually bit: clipping the wrong six seconds
+
+Worth reading before touching the labelers, because it cost a full dataset and
+looked exactly like a modelling problem.
+
+`hb_label.py` originally cut each clip at a fixed offset behind the win caption,
+assuming the caption follows the bout. **It appears during the replay.** Measured
+caption-minus-tachiai over 14 bouts: **13-91 s**, clustering at 25-40. So the
+6 s window landed 12-35 s after the bout ended, and **59% of the first 68-clip
+dataset contained no wrestling at all** -- post-bout close-ups of the winner's
+face, crowd shots, walk-offs.
+
+Nothing failed. The labels were right, the clips played, training completed, and
+the head sat at chance (balanced accuracy 0.246 vs 0.250) while the *same*
+embeddings predicted the source video at 0.796 vs 0.250 chance. They were healthy
+and information-rich -- encoding venue and lighting, because that is all most clips
+held. Every visible symptom pointed at "too few videos".
+
+**The lesson: verify what is IN the clips, not just that clips exist.** One contact
+sheet would have caught this before four videos of labelling. Hence
+`--probe-window`, which is now as mandatory as `--probe`:
+
+```bash
+python hb_label.py --probe-window <video-id>   # every row must show the bout
+```
+
+`hb_window.py` locates the bout by finding **the longest sustained wide shot of the
+dohyo** before the caption -- it looks for the wrestling itself rather than for a
+graphic that precedes it. Two discriminators were measured and **rejected**; don't
+re-add either without re-measuring:
+
+- **frame-to-frame motion** -- junk 9.8-35.8, good 9.0-35.5, fully overlapping. A
+  close-up of a walking wrestler moves as much as a bout.
+- **total clay fraction** -- junk 19-48%, good 28-57%, overlapping.
+
+What separates them is the *shape* of the clay, not its amount: a wide dohyo shot
+spreads pale clay across nearly the full frame width (89-100% of columns), a
+close-up does not (43-70%).
+
 ## The two leakage traps
 
 **1. The answer is printed in the frames.** A vision transformer reads glyphs
@@ -153,7 +192,13 @@ needed. See `HERBERT.md` for the full assessment.
 python hb_manifest.py                     # descriptions -> hb_bouts.csv (1647 bouts)
 python hb_label.py --probe <video-id>     # check WIN_BOX before a long run
 python hb_label.py --resume               # OCR -> data_hb/<kimarite>/*.mp4
+python hb_label.py --probe-window <id>    # then CHECK THE CLIPS HOLD THE BOUT
+python hb_recut.py --dry-run              # re-cut existing labels after a fix
 ```
+
+Both probes are calibration, not decoration: `--probe` checks the caption is being
+read, `--probe-window` checks the footage is the bout. Skipping the second is what
+produced a 59%-junk dataset.
 
 From there it rejoins the NHK path: `extract_features.py --data data_hb` etc.
 
@@ -163,9 +208,26 @@ duplicate). A 28-bout spot check across **5 tournaments and both resolutions**
 (854x480 and 640x360) labeled 24/28 -- so `WIN_BOX`, calibrated on a single Haru
 2026 video, transfers. **14% miss rate**, consistent across both checks.
 
-The pilot label pass over 270 bouts was **started and stopped at 12** because
-video decode + OCR is sustained-100%-CPU work and the laptop was too loud for it.
-`hb_labels.csv` holds those 12; `--resume` skips them. Nothing else is blocking.
+**Labelled so far: 4 videos, 68 captions read, 60 clips** (88% of bouts locate a
+usable window; the other 12% are dropped rather than guessed at). All 60 verified
+to be 100% wide-dohyo footage. 10 of the 14 pilot videos remain, then 68 more in
+the manifest.
+
+Scores on those 60 clips, 4-fold grouped CV on the 6 official families:
+
+| dataset | accuracy | balanced acc | f1_macro |
+|---|---|---|---|
+| caption-anchored (59% junk) | 0.460 | 0.246 | 0.202 |
+| banner-anchored (15% junk) | 0.532 | 0.275 | 0.254 |
+| bout-anchored (0% junk) | 0.467 | **0.301** | 0.260 |
+
+Read `balanced_accuracy` against 0.250 chance, not `accuracy` against the 0.583
+majority baseline -- the head uses `class_weight="balanced"`, so plain accuracy
+penalizes it for not riding the majority class. Balanced accuracy has moved
+0.246 -> 0.301 as the clips got cleaner, and the cross-video technique signal went
+from p=0.70 (wrong direction) to p=0.12 (right direction). Both are still weak: 60
+clips over 4 videos cannot resolve much. The next real test is more videos, now
+that the ones being labelled contain the bout.
 
 **Cost, measured:** ~20 s/bout single-process, so 270 bouts ~1.5 h and all 1647
 ~9 h. Do not parallelize on a laptop -- see the note in `extract_strips()`.
