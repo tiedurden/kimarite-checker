@@ -27,6 +27,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
+
 import kimarite
 from hb_window import cut_clip, find_bout_window, probe_window
 
@@ -101,6 +103,33 @@ MIN_VOTES = 2
 # coin flip between two lookalike techniques and we'd rather record a miss.
 VOTE_MARGIN = 2
 
+# --- Skipping frames that cannot hold a caption -----------------------------------
+#
+# Measured: OCR is 96% of the per-bout cost (24s of 25s), and almost all of that is
+# process launches -- 135 tesseract invocations at ~180ms each, on frames of which
+# only ~21 contain a caption at all.
+#
+# Text has a signature the empty strip does not: glyph strokes make many bright/dark
+# transitions along each row. Mean absolute horizontal gradient measures it in one
+# numpy op on frames ffmpeg is already decoding.
+#
+# This is NOT a clean separator and must not be treated as one. Over 23 bouts only
+# 7 separated cleanly (caption 1.02-18.41 vs other 0.18-16.99, badly overlapping) --
+# a bright churning crowd shot has plenty of edge energy too. The same trap as the
+# rejected motion gate in hb_window.py: one bout looked perfectly separable.
+#
+# It works here because separation is not what is needed. The vote logic needs
+# MIN_VOTES=2 agreeing reads out of a ~21-frame caption, so the filter only has to
+# keep a couple of caption frames, and false positives cost nothing but an OCR call
+# that fails the regex. Measured over 34 bouts spanning all 4 videos: at 4.0 the
+# WORST bout still keeps 16 caption frames, 0 bouts fall under 2, and OCR drops to
+# 31% of frames. 16-vs-2 is headroom, not a knife-edge.
+#
+# If a new source starts missing captions, RAISE nothing -- set this to 0.0 to
+# disable and confirm the filter is the cause before touching the OCR path.
+EDGE_MIN = 4.0
+EDGE_SCALE = 2          # crop upscale for the gradient pass; 4x costs more, adds nothing
+
 
 def box_px(box, w: int, h: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = box
@@ -151,17 +180,83 @@ def extract_strips(path: Path, start: float, end: float, w: int, h: int,
     return sorted(tmp.glob("strip_*.png"))
 
 
+def _decode_ocr(out: bytes) -> str:
+    """Decode tesseract output tolerantly.
+
+    Decode explicitly, errors="replace". OCR on broadcast video regularly emits
+    bytes that are not valid in the console's locale encoding (cp1252 on this box),
+    and text=True decodes with that locale -- so a single stray 0x9d from a noisy
+    frame killed the whole run at bout 5 of 21. The garbage frames are exactly the
+    ones we expect to fail the regex anyway; they must not be fatal.
+    """
+    return (out or b"").decode("utf-8", errors="replace")
+
+
 def ocr_png(png: Path) -> str:
     """OCR one already-extracted strip."""
-    # Decode explicitly, errors="replace". OCR on broadcast video regularly emits
-    # bytes that are not valid in the console's locale encoding (cp1252 on this
-    # box), and text=True decodes with that locale -- so a single stray 0x9d from
-    # a noisy frame killed the whole run at bout 5 of 21. The garbage frames are
-    # exactly the ones we expect to fail the regex anyway; they must not be fatal.
     r = subprocess.run(
         ["tesseract", str(png), "stdout", "--psm", "7", "-l", "eng"],
         capture_output=True)
-    return (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    return _decode_ocr(r.stdout).strip()
+
+
+def ocr_batch(pngs: list[Path], tmp: Path) -> list[str]:
+    """OCR many strips in ONE tesseract process. Returns one string per input.
+
+    Given a file whose name ends in .txt, tesseract reads it as a LIST of images
+    and emits their text separated by form feeds. Measured 24s -> 10s for 135
+    strips: the per-launch overhead dominated, not the recognition.
+
+    The output must line up index-for-index with the input, because find_caption
+    maps index back to a timestamp for first_seen_t. Tesseract emits exactly one
+    page per input in order, so a form-feed split is the mapping -- but it is
+    verified against len(pngs) below rather than assumed, and a mismatch falls back
+    to per-file OCR. Silently misaligning reads would shift every caption_t and put
+    the clip window in the wrong place, which is precisely the class of bug that
+    cost the first dataset.
+    """
+    if not pngs:
+        return []
+    lst = tmp / "_ocr_list.txt"
+    lst.write_text("\n".join(str(p) for p in pngs), encoding="utf-8")
+    r = subprocess.run(["tesseract", str(lst), "stdout", "--psm", "7", "-l", "eng"],
+                       capture_output=True)
+    pages = _decode_ocr(r.stdout).split("\f")
+    # Tesseract appends a trailing form feed after the last page on some builds.
+    if len(pages) == len(pngs) + 1 and not pages[-1].strip():
+        pages.pop()
+    if len(pages) != len(pngs):
+        print(f"      OCR batch returned {len(pages)} pages for {len(pngs)} strips "
+              f"-- falling back to per-file OCR")
+        return [ocr_png(p) for p in pngs]
+    return [p.strip() for p in pages]
+
+
+def caption_candidates(path: Path, t0: float, end: float, w: int, h: int
+                       ) -> set[int] | None:
+    """Frame indices whose caption strip has enough edge energy to hold text.
+
+    Returns None if the gradient pass cannot be run, meaning "OCR everything" --
+    degrading to the slow-but-correct path rather than to an empty result.
+    """
+    if EDGE_MIN <= 0:
+        return None
+    cw, ch, cx, cy = box_px(WIN_BOX, w, h)
+    W, H = cw * EDGE_SCALE, ch * EDGE_SCALE
+    raw = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{t0:.2f}",
+         "-t", f"{end - t0:.2f}", "-i", str(path),
+         "-vf", f"fps={SEARCH_FPS},crop={cw}:{ch}:{cx}:{cy},"
+                f"scale=iw*{EDGE_SCALE}:ih*{EDGE_SCALE}:flags=lanczos,format=gray",
+         "-pix_fmt", "gray", "-f", "rawvideo", "-"],
+        capture_output=True).stdout
+    n = len(raw) // (W * H)
+    if n == 0:
+        return None
+    f = np.frombuffer(raw[: n * W * H], dtype=np.uint8) \
+          .reshape(n, H, W).astype(np.float32)
+    edge = np.abs(np.diff(f, axis=2)).mean(axis=(1, 2))
+    return {int(i) for i in np.flatnonzero(edge > EDGE_MIN)}
 
 
 def normalize_ocr(raw: str) -> str | None:
@@ -207,8 +302,16 @@ def find_caption(path: Path, start: float, end: float, w: int, h: int,
     votes: Counter = Counter()
     winners: dict[str, str] = {}
     first_t: dict[str, float] = {}
-    for i, png in enumerate(extract_strips(path, t0, end, w, h, tmp)):
-        text = ocr_png(png)
+
+    strips = extract_strips(path, t0, end, w, h, tmp)
+    # Skip strips that cannot hold text before paying for OCR. Both passes sample at
+    # SEARCH_FPS from the same t0, so their indices refer to the same frames.
+    keep = caption_candidates(path, t0, end, w, h)
+    idx = [i for i in range(len(strips))
+           if keep is None or i in keep]
+    texts = ocr_batch([strips[i] for i in idx], tmp)
+
+    for i, text in zip(idx, texts):
         if m := WIN_RE.search(text):
             canon = normalize_ocr(m.group(2))
             if canon:

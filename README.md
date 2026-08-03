@@ -229,8 +229,24 @@ from p=0.70 (wrong direction) to p=0.12 (right direction). Both are still weak: 
 clips over 4 videos cannot resolve much. The next real test is more videos, now
 that the ones being labelled contain the bout.
 
-**Cost, measured:** ~20 s/bout single-process, so 270 bouts ~1.5 h and all 1647
-~9 h. Do not parallelize on a laptop -- see the note in `extract_strips()`.
+**Cost, measured: ~2.5 s/bout** single-process, so 270 bouts ~11 min and all 1647
+~70 min. Do not parallelize on a laptop -- see the note in `extract_strips()`;
+there is no longer much reason to.
+
+It was 25 s/bout, of which OCR was 24 s -- and that was 135 tesseract *process
+launches* per bout, not recognition. Two fixes, together 8x, verified to reproduce
+all 68 existing labels exactly:
+
+- **one batched tesseract call** instead of 135. Passed a `.txt` file it reads it as
+  an image list and emits form-feed-separated pages (24 s -> 10 s).
+- **an edge-energy prefilter** (`EDGE_MIN`) skipping strips too smooth to hold
+  glyphs, cutting OCR to 31% of frames. Note this is *not* a clean separator -- over
+  23 bouts only 7 separated cleanly. It works because the vote logic needs 2 reads
+  out of ~21 caption frames, and the worst of 34 bouts still keeps 16.
+
+**A GPU does not help here.** Labelling is ffmpeg + tesseract, neither CUDA. Only
+`extract_features.py` is torch, and at ~2 s/clip embedded once, the GPU saves
+minutes across the whole dataset.
 
 **If you clone this somewhere new**, the only local state worth carrying is
 `hb_labels.csv`. Videos re-download in ~10 min at 7 MB/s, and `hb_bouts.csv`
