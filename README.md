@@ -79,6 +79,18 @@ it instead of watching the wrestling -- ~99% here, chance on uncaptioned video.
 Two independent defenses: clips end *before* the overlay appears (`PAD`), and the
 overlay region is painted black in every extracted frame (`MASK_OVERLAY`).
 
+**The caption is not the only leak.** The Herbert broadcast also puts the winner's
+shikona on a white plate at the bottom-centre of frame, and it appears *after the
+bout ends but before the win caption* -- so a bout window that runs to the finish
+catches it in its last seconds. The winner's name is not the technique, but it is
+strongly correlated with it, and glyphs are far easier to read than wrestling. It
+sat below all three original mask boxes and went unnoticed until a contact sheet of
+a new video showed it. Now `LEAK_BOXES_HB` masks the full width below y=0.92.
+
+Generalize from that: **on a new source, list every graphic the broadcast can put on
+screen between the charge and the caption**, not just the caption. Check a contact
+sheet of the last seconds of a window, where post-bout overlays live.
+
 **2. Bouts from one video are not independent.** They share venue, lighting,
 camera, commentary, often wrestlers. `train_head.py` splits by **source video**,
 never by bout. With 45 videos your effective sample size for generalization is
@@ -208,26 +220,49 @@ duplicate). A 28-bout spot check across **5 tournaments and both resolutions**
 (854x480 and 640x360) labeled 24/28 -- so `WIN_BOX`, calibrated on a single Haru
 2026 video, transfers. **14% miss rate**, consistent across both checks.
 
-**Labelled so far: 4 videos, 68 captions read, 60 clips** (88% of bouts locate a
-usable window; the other 12% are dropped rather than guessed at). All 60 verified
-to be 100% wide-dohyo footage. 10 of the 14 pilot videos remain, then 68 more in
-the manifest.
+**Labelled so far: the full 14-video pilot, 191 clips.** Of 270 manifest bouts: 25
+OCR misses, 20 with no locatable bout window, 6 non-techniques correctly rejected
+(`fusen` x4, `tsukite`, `isamiashi`). 68 videos / 1377 bouts remain in the manifest.
 
-Scores on those 60 clips, 4-fold grouped CV on the 6 official families:
+### The result: tripling the data changed nothing
 
-| dataset | accuracy | balanced acc | f1_macro |
-|---|---|---|---|
-| caption-anchored (59% junk) | 0.460 | 0.246 | 0.202 |
-| banner-anchored (15% junk) | 0.532 | 0.275 | 0.254 |
-| bout-anchored (0% junk) | 0.467 | **0.301** | 0.260 |
+4-fold grouped CV, 4 official families, `--coarse --min-class 15`:
 
-Read `balanced_accuracy` against 0.250 chance, not `accuracy` against the 0.583
-majority baseline -- the head uses `class_weight="balanced"`, so plain accuracy
-penalizes it for not riding the majority class. Balanced accuracy has moved
-0.246 -> 0.301 as the clips got cleaner, and the cross-video technique signal went
-from p=0.70 (wrong direction) to p=0.12 (right direction). Both are still weak: 60
-clips over 4 videos cannot resolve much. The next real test is more videos, now
-that the ones being labelled contain the bout.
+| dataset | accuracy | balanced acc | f1_macro | perm p |
+|---|---|---|---|---|
+| 60 clips / 4 videos | 0.467 +/- 0.115 | 0.301 +/- 0.053 | 0.260 | 0.120 |
+| **191 clips / 13 videos** | 0.440 +/- 0.084 | **0.302** +/- 0.033 | 0.267 | **0.305** |
+
+3.2x the clips and 3.3x the source videos moved balanced accuracy by **+0.001**.
+Accuracy loses to the 0.597 majority baseline in both. Read `balanced_accuracy`
+against chance, not `accuracy` against the majority baseline -- the head uses
+`class_weight="balanced"`, so plain accuracy penalizes it for not riding the
+majority class.
+
+The decisive number is the permutation test, which got *worse*: p 0.120 -> 0.305
+(z = +0.34 on 6867 cross-video same-technique pairs). A real effect starved of data
+sharpens when the data arrives; this collapsed toward the null. **The earlier
+p = 0.120 was noise.** Do not read it as early signal, and do not re-run "just add
+more videos" expecting a different answer -- that experiment has been run.
+
+So, with the input verified 100% bout footage and leaks masked, this is now a
+statement about the method: **frozen VideoMAE embeddings of whole bout clips do not
+linearly encode kimarite.**
+
+Most likely why: VideoMAE samples 16 frames evenly across whatever it is given, so
+an 8-30s clip is sampled every ~1.25s while the technique is decided in the final
+half-second. `oshidashi` vs `oshitaoshi` differ only in whether the loser ended
+standing or fallen. Fixing the clip window made clips longer and more complete,
+which may have diluted the decisive moment further.
+
+Next experiments, cheapest first:
+
+1. **Cut only the last 3-4s.** `hb_recut.py` re-cuts from the stored `caption_t` at
+   ~2s/bout with no re-OCR, so this is ~10 min end to end. Highest value per minute.
+2. **Concatenate whole-bout + finish-only embeddings** (1536-dim): keeps context,
+   adds resolution where the evidence is.
+3. **Only then** label the remaining 68 videos. Adding data to a representation
+   showing no signal is what step 1 above already tested.
 
 **Cost, measured: ~2.5 s/bout** single-process, so 270 bouts ~11 min and all 1647
 ~70 min. Do not parallelize on a laptop -- see the note in `extract_strips()`;

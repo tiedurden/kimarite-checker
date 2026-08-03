@@ -45,10 +45,30 @@ WIN_BOX = (0.00, 0.729, 0.445, 0.800)
 #   "Next up: A VS B"       bottom-left, below that
 #   shikona boards          top-left     (kanji names of both wrestlers)
 #   LIVE badge              top-right
+#   winner name plate       bottom-center, BELOW all of the above
 LEAK_BOXES_HB = [
     (0.00, 0.66, 0.55, 0.85),   # win line, score line, REPLAY, "Next up"
     (0.00, 0.00, 0.36, 0.10),   # shikona boards (top-left)
     (0.90, 0.03, 1.00, 0.12),   # LIVE badge (top-right)
+    # The winner's shikona on a white plate, e.g. "SHONANNOUMI". It appears AFTER the
+    # bout ends but BEFORE the win caption, so bout windows that run to the finish can
+    # catch it in their last seconds -- measured inside bout #1 of 28k6Dg0ExjI, whose
+    # window ends at 77.7s with the plate up at 76s. That is a label leak as real as
+    # the caption itself: the winner's name is not the technique, but it is strongly
+    # correlated with it, and a transformer reads it far more easily than it reads
+    # wrestling.
+    #
+    # Full width rather than the measured x 0.385-0.611: the plate is centred and its
+    # width tracks the name's length (0.385-0.611 for SHONANNOUMI, 0.422-0.575 for a
+    # shorter one), so a tight box calibrated on one name clips a longer one. Nothing
+    # below y=0.92 carries bout information -- it is the near edge of the dohyo and the
+    # front row of cushions -- so full width costs nothing and removes the guesswork.
+    #
+    # Measured top edge y=0.933 across 4 bouts; 0.92 gives it margin. It sits below
+    # the y<=0.85 box above, which is why it needed its own entry rather than an
+    # extension: widening THAT box downward would also have swallowed the lower dohyo
+    # through the whole bout.
+    (0.00, 0.92, 1.00, 1.00),   # winner name plate (bottom-centre)
 ]
 MASK_MARGIN = 0.02
 
