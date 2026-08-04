@@ -206,6 +206,7 @@ python hb_label.py --probe <video-id>     # check WIN_BOX before a long run
 python hb_label.py --resume               # OCR -> data_hb/<kimarite>/*.mp4
 python hb_label.py --probe-window <id>    # then CHECK THE CLIPS HOLD THE BOUT
 python hb_recut.py --dry-run              # re-cut existing labels after a fix
+python hb_finish.py --len 3               # last 3s only -> data_finish/ (see below)
 ```
 
 Both probes are calibration, not decoration: `--probe` checks the caption is being
@@ -255,14 +256,54 @@ half-second. `oshidashi` vs `oshitaoshi` differ only in whether the loser ended
 standing or fallen. Fixing the clip window made clips longer and more complete,
 which may have diluted the decisive moment further.
 
+### What did work: hand the encoder the finish, not the bout
+
+`hb_finish.py` re-cuts the last N seconds from the stored `bout_start`/`bout_end`
+(no OCR, no window search, ~1s/bout) into its own dataset directory. **Same 191
+clips, same labels, same folds -- only the framing changes.** 4 official families,
+`--min-class 15`, 5-fold grouped CV:
+
+| window | accuracy | balanced acc | f1_macro | paired delta bal.acc | t |
+|---|---|---|---|---|---|
+| whole bout (8-30s) | 0.440 +/- 0.084 | 0.302 +/- 0.033 | 0.267 | -- | -- |
+| 2s | 0.544 +/- 0.070 | 0.379 +/- 0.048 | 0.362 | **+0.077** | **+2.50** |
+| 3s | **0.572** +/- 0.106 | 0.399 +/- 0.080 | 0.379 | +0.097 | +1.93 |
+| 4s | 0.531 +/- 0.067 | 0.383 +/- 0.064 | 0.366 | +0.081 | +1.68 |
+| 6s | 0.520 +/- 0.097 | **0.422** +/- 0.105 | **0.382** | +0.120 | +1.74 |
+
+Chance 0.250; majority baseline 0.597. The deltas are **paired per-fold** against
+the whole-bout run on identical splits -- the two datasets share bout ids, so that
+is far more sensitive than comparing two error bars at 5 folds. 4/5 folds improve
+for every window length.
+
+For scale, against the other lever: 3.3x more source videos bought +0.004
+(t = 0.40); reframing the *same* clips bought +0.077 to +0.120. **Temporal
+resolution was the bottleneck, not sample size.**
+
+**The window length is not resolved and don't claim it is.** Pairwise paired t
+between 2/3/4/6s: all |t| <= 1.72. 6s has both the largest mean gain and a lower
+t than 2s -- that is one fact, not two: its variance is triple. What the data
+supports is "anything but the whole bout", not an optimum. Also note no window
+beats the 0.597 majority baseline on plain accuracy yet; the model is now clearly
+better than chance and still not better than always guessing `kihonwaza`.
+
+**Known gap.** A contact sheet of the 4s clips showed 5/6 holding the decisive
+moment, but one (`3j4r7V1bzlQ#2`, `oshitaoshi`) was pure aftermath -- a wrestler
+already down, then face close-ups -- so `bout_end` sometimes overshoots the finish.
+`hb_finish.py --tail N` exists to trim that and **has not been tested**. If the
+finish result is worth pushing further, that is the next cheap thing.
+
 Next experiments, cheapest first:
 
-1. **Cut only the last 3-4s.** `hb_recut.py` re-cuts from the stored `caption_t` at
-   ~2s/bout with no re-OCR, so this is ~10 min end to end. Highest value per minute.
+1. **`--tail` sweep**, per the gap above: the measured win may be capped by clips
+   whose last seconds are aftermath rather than technique.
 2. **Concatenate whole-bout + finish-only embeddings** (1536-dim): keeps context,
-   adds resolution where the evidence is.
-3. **Only then** label the remaining 68 videos. Adding data to a representation
-   showing no signal is what step 1 above already tested.
+   adds resolution where the evidence is. This is why `hb_finish.py` writes a
+   separate directory instead of overwriting `data_hb/` -- both must exist at once.
+3. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result
+   says the framing was wrong; it does not say VideoMAE-base is sufficient.
+4. **Only then** label the remaining 68 videos. Adding data to this representation
+   is the experiment that already measured as no help.
 
 **Cost, measured: ~2.5 s/bout** single-process, so 270 bouts ~11 min and all 1647
 ~70 min. Do not parallelize on a laptop -- see the note in `extract_strips()`;
