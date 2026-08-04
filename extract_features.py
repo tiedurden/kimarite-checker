@@ -34,16 +34,39 @@ MODEL_ID = "MCG-NJU/videomae-base"
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 
 
-def decode_frames(path: Path, num_frames: int = NUM_FRAMES) -> np.ndarray | None:
+def clip_duration(path: Path) -> float | None:
+    """Seconds, via ffprobe. None if it cannot be read."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def decode_frames(path: Path, num_frames: int = NUM_FRAMES,
+                  t0: float | None = None, t1: float | None = None
+                  ) -> np.ndarray | None:
     """Decode `num_frames` evenly-spaced RGB frames via ffmpeg.
 
     ffmpeg instead of decord/av: no build toolchain, no Python-version wheel
     roulette, and it handles the long tail of broken containers that torchvision
     chokes on. Cost is one subprocess per clip, which is noise next to the GPU.
+
+    t0/t1 restrict decoding to a time range. Multi-scale prediction needs this: the
+    head is trained on the last N seconds of a bout at several N, so inference has to
+    cut the same windows out of one input file rather than embed the whole thing.
     """
     # fps filter can't hit an exact count, so oversample then pick indices.
+    seek = []
+    if t0 is not None:
+        seek += ["-ss", f"{t0:.2f}"]
+    if t1 is not None:
+        seek += ["-t", f"{max(0.0, t1 - (t0 or 0.0)):.2f}"]
     cmd = [
-        "ffmpeg", "-v", "error", "-i", str(path),
+        "ffmpeg", "-v", "error", *seek, "-i", str(path),
         "-vf", f"scale={RESIZE}:{RESIZE}:force_original_aspect_ratio=increase,"
                f"crop={RESIZE}:{RESIZE}",
         "-pix_fmt", "rgb24", "-f", "rawvideo", "-",

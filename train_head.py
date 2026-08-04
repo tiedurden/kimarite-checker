@@ -29,7 +29,34 @@ def group_of(stem: str) -> str:
     return m.group(1) if m else stem
 
 
-def load(cache: Path):
+def load_many(caches: list[Path]):
+    """Concatenate several caches of the SAME clips into one feature block.
+
+    Multi-scale features are the single biggest measured win in this project (see
+    README): 2s+3s+6s finish embeddings score 0.480 balanced accuracy against 0.302
+    for the whole bout, permutation p = 0.005. Each cache holds the same 191 bouts
+    embedded at a different clip length, so concatenating them hands the head several
+    temporal resolutions of the same finish.
+
+    The clip name lists must match exactly across caches. A mismatch would pair one
+    bout's 2s vector with a different bout's 6s vector -- silently, since the shapes
+    would still line up -- so it aborts rather than warns.
+    """
+    per = [load_one(c) for c in caches]
+    ref_names = per[0][3]
+    for cache, (_, _, _, names) in zip(caches[1:], per[1:]):
+        if names != ref_names:
+            missing = sorted(set(ref_names) ^ set(names))[:4]
+            raise SystemExit(
+                f"{caches[0]}/ and {cache}/ hold different clips "
+                f"({len(ref_names)} vs {len(names)}); e.g. {missing}.\n"
+                f"Concatenating them would pair one bout's features with another's. "
+                f"Re-run extract_features.py so both caches cover the same clips.")
+    X = np.hstack([p[0] for p in per])
+    return X, per[0][1], per[0][2], ref_names
+
+
+def load_one(cache: Path):
     X, y, groups, names = [], [], [], []
     for npy in sorted(cache.rglob("*.npy")):
         rel = npy.relative_to(cache)
@@ -44,7 +71,9 @@ def load(cache: Path):
         # grouping exists to stop. Observed as "12 clips into 6 source videos" for
         # 12 clips that all came from a single video.
         groups.append(group_of(npy.stem))
-        names.append(str(rel))
+        # Name WITHOUT the category dir, so the cross-cache check below compares
+        # bouts rather than bout+label. The label comes along in y either way.
+        names.append(npy.stem)
     if not X:
         raise SystemExit(f"no .npy under {cache}/ -- run extract_features.py first")
     return np.stack(X), np.array(y), np.array(groups), names
@@ -52,7 +81,9 @@ def load(cache: Path):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache", default="cache", type=Path)
+    ap.add_argument("--cache", default="cache", type=Path, nargs="+",
+                    help="one cache, or several of the SAME clips at different clip "
+                         "lengths -- they are concatenated (multi-scale features)")
     ap.add_argument("--out", default="models/head.joblib", type=Path)
     ap.add_argument("--test-frac", type=float, default=0.25)
     ap.add_argument("--seed", type=int, default=0)
@@ -60,9 +91,27 @@ def main() -> None:
                     help="classes with fewer clips are folded into 'other'; 0 disables")
     ap.add_argument("--coarse", action="store_true",
                     help="train on the 6 official families instead of techniques")
+    ap.add_argument("--scales", type=float, nargs="+",
+                    help="finish-clip length (s) each --cache was built from, in the "
+                         "same order; recorded in the model so predict.py can rebuild "
+                         "the same feature vector")
     args = ap.parse_args()
 
-    X, y, groups, names = load(args.cache)
+    if args.scales and len(args.scales) != len(args.cache):
+        raise SystemExit(f"--scales has {len(args.scales)} values but --cache has "
+                         f"{len(args.cache)}; they must correspond in order")
+    if len(args.cache) > 1 and not args.scales:
+        # Not fatal for training -- the CV score is valid either way -- but the saved
+        # model cannot be used by predict.py, and finding that out later is worse than
+        # a warning now.
+        print("NOTE: multi-scale training without --scales. The CV numbers are valid, "
+              "but predict.py\n      cannot use the saved model: nothing records which "
+              "clip length each block came from.")
+
+    X, y, groups, names = load_many(args.cache)
+    if len(args.cache) > 1:
+        print(f"multi-scale: {len(args.cache)} caches concatenated -> dim {X.shape[1]} "
+              f"({', '.join(c.name for c in args.cache)})")
 
     if args.coarse:
         # 82-way on ~675 bouts is hopeless; 6-way on the official families is a
@@ -105,7 +154,8 @@ def main() -> None:
     # videos".
     if n_groups < 2:
         raise SystemExit(
-            f"only {n_groups} source video in {args.cache}/ -- a leakage-safe split "
+            f"only {n_groups} source video in "
+            f"{', '.join(str(c) for c in args.cache)} -- a leakage-safe split "
             f"needs >=2.\nLabel bouts from more videos (clips from one video are "
             f"near-duplicates: same venue,\nlighting, camera and often wrestlers, so "
             f"a within-video score means nothing).")
@@ -155,19 +205,40 @@ def main() -> None:
 
     # Grouped CV: one split on a few hundred clips is a high-variance estimate.
     n_folds = min(5, n_groups, min(counts.values()))
+    cv_bal = None
     if n_folds >= 2:
-        scores = cross_val_score(clf, X, y, groups=groups,
-                                 cv=GroupKFold(n_splits=n_folds))
-        print(f"\n{n_folds}-fold grouped CV: {scores.mean():.3f} "
+        cv = GroupKFold(n_splits=n_folds)
+        scores = cross_val_score(clf, X, y, groups=groups, cv=cv)
+        print(f"\n{n_folds}-fold grouped CV accuracy: {scores.mean():.3f} "
               f"(+/- {scores.std():.3f})  {np.round(scores, 3)}")
+        # Balanced accuracy too, because it is the metric this project is judged on:
+        # with class_weight='balanced' the head is deliberately not riding the
+        # majority class, so plain accuracy penalizes it for doing what it was told.
+        # Reporting only accuracy is what made an above-chance result look like a
+        # failure. Read this against 1/n_classes, and accuracy against the majority
+        # baseline printed above.
+        bal = cross_val_score(clf, X, y, groups=groups, cv=cv,
+                              scoring="balanced_accuracy")
+        cv_bal = float(bal.mean())
+        print(f"{n_folds}-fold grouped CV balanced acc: {bal.mean():.3f} "
+              f"(+/- {bal.std():.3f})  {np.round(bal, 3)}   "
+              f"[chance {1 / len(counts):.3f}]")
 
     # Ship a model trained on everything; the scores above are the honest estimate.
     clf.fit(X, y)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": clf, "labels": labels, "dim": int(X.shape[1])}, args.out)
+    # `scales` is what lets predict.py rebuild a multi-scale feature vector: without
+    # it a 2304-dim head is unusable, because nothing records that those dims are
+    # 2s|3s|6s of the finish rather than one 2304-dim encoder. Stored as None for a
+    # single cache so old single-scale bundles keep working.
+    joblib.dump({"model": clf, "labels": labels, "dim": int(X.shape[1]),
+                 "scales": args.scales, "caches": [str(c) for c in args.cache]},
+                args.out)
     args.out.with_suffix(".json").write_text(json.dumps(
         {"labels": labels, "counts": dict(counts), "n_clips": len(X),
-         "n_source_videos": n_groups}, indent=2))
+         "n_source_videos": n_groups, "dim": int(X.shape[1]),
+         "caches": [str(c) for c in args.cache], "scales": args.scales,
+         "cv_balanced_accuracy": cv_bal}, indent=2))
     print(f"\nsaved -> {args.out}")
 
 

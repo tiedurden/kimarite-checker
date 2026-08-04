@@ -182,6 +182,11 @@ python extract_features.py
 ```bash
 python train_head.py                # top techniques + 'other'
 python train_head.py --coarse       # 6 official families -- easier, good sanity check
+
+# Best configuration measured (see "Multi-scale features" below): the same finish
+# embedded at 2s, 3s and 6s, concatenated into one 2304-dim feature.
+python train_head.py --cache cache_fin2 cache_fin3 cache_fin6 --scales 2 3 6 \
+    --coarse --min-class 15 --out models/head_multiscale.joblib
 ```
 
 **6. Predict:**
@@ -243,12 +248,19 @@ majority class.
 The decisive number is the permutation test, which got *worse*: p 0.120 -> 0.305
 (z = +0.34 on 6867 cross-video same-technique pairs). A real effect starved of data
 sharpens when the data arrives; this collapsed toward the null. **The earlier
-p = 0.120 was noise.** Do not read it as early signal, and do not re-run "just add
-more videos" expecting a different answer -- that experiment has been run.
+p = 0.120 was noise.**
 
-So, with the input verified 100% bout footage and leaks masked, this is now a
-statement about the method: **frozen VideoMAE embeddings of whole bout clips do not
-linearly encode kimarite.**
+**Scope that conclusion correctly.** It says *whole-bout* embeddings do not improve
+with more data -- it does NOT say the project is data-saturated. The finish-only and
+multi-scale results below overturned the representation this was measured on, so the
+learning curve has to be re-measured there before "more videos won't help" can be
+repeated. Reading it as a general claim is how a fixable framing bug gets mistaken
+for a ceiling.
+
+So, with the input verified 100% bout footage and leaks masked, this is a statement
+about the framing: **frozen VideoMAE embeddings of WHOLE BOUT clips do not linearly
+encode kimarite.** The word "whole" turned out to be carrying the whole finding --
+see below.
 
 Most likely why: VideoMAE samples 16 frames evenly across whatever it is given, so
 an 8-30s clip is sampled every ~1.25s while the technique is decided in the final
@@ -287,23 +299,94 @@ supports is "anything but the whole bout", not an optimum. Also note no window
 beats the 0.597 majority baseline on plain accuracy yet; the model is now clearly
 better than chance and still not better than always guessing `kihonwaza`.
 
+### Multi-scale features: the best result so far
+
+Concatenating the *same* finish at several lengths beats any single length. This is
+free to test -- the caches are aligned clip-for-clip, so it is a `numpy.hstack`, not
+another encoder pass. `hb_sweep.py` runs the whole table:
+
+| features | dim | accuracy | balanced acc | f1_macro | paired delta vs whole | t |
+|---|---|---|---|---|---|---|
+| whole bout | 768 | 0.440 | 0.302 | 0.267 | -- | -- |
+| 6s | 768 | 0.520 | 0.422 | 0.382 | +0.120 | +1.74 |
+| whole+2s | 1536 | 0.526 | 0.319 | 0.283 | +0.016 | +0.47 |
+| whole+6s | 1536 | 0.492 | 0.341 | 0.336 | +0.038 | +1.05 |
+| 2s+6s | 1536 | 0.591 | 0.460 | 0.432 | +0.158 | +2.85 |
+| **2s+3s+6s** | **2304** | **0.604** | **0.480** | **0.459** | **+0.178** | **+4.19, 5/5 folds** |
+| 2s+3s+4s+6s | 3072 | 0.584 | 0.463 | 0.440 | +0.160 | +3.52 |
+| 6s x3 (control) | 2304 | 0.525 | 0.424 | 0.384 | +0.122 | +1.78 |
+| 2s x3 (control) | 2304 | 0.554 | 0.387 | 0.372 | +0.084 | +2.38 |
+
+**The controls are the point.** A 3x wider feature block changes the regularization
+budget on its own at n=191, so "wider won" is not evidence that multi-scale works.
+Repeating ONE cache three times holds dim fixed at 2304 and adds exactly zero
+information: `6s x3` gains **+0.002** over 6s alone, while `2s+3s+6s` gains +0.058.
+The win is temporal content, not width. Keep those rows in any future sweep.
+
+Note also that adding the **whole bout** to a finish clip barely helps (+0.016,
++0.038) while adding a *second finish length* helps a lot. The whole-bout embedding
+is not contributing context; it is contributing noise.
+
+**The permutation test finally clears.** Same 200-permutation within-video test that
+showed nothing before:
+
+| features | balanced acc | null | p | z |
+|---|---|---|---|---|
+| whole bout | 0.302 | 0.251 +/- 0.037 | 0.119 | +1.37 |
+| **2s+3s+6s** | **0.480** | 0.253 +/- 0.034 | **0.005** | **+6.75** |
+
+p = 0.005 is the floor at 200 permutations -- zero shuffles beat it.
+
+**It holds on fine-grained techniques too**, not just the 4 coarse families
+(`--min-class 15`, 4 technique classes, chance 0.250, majority 0.372):
+
+| features | accuracy | balanced acc | f1_macro |
+|---|---|---|---|
+| whole bout | 0.302 | 0.284 | 0.243 |
+| 6s | 0.356 | 0.319 | 0.309 |
+| 2s+3s+6s | **0.392** | **0.367** | **0.348** |
+
+That 0.392 is the **first configuration to beat the majority baseline** (0.372); the
+whole-bout model lost to it badly. On the coarse families accuracy 0.604 still only
+just edges the 0.597 baseline, so treat that as parity, not a win.
+
+Train and use it:
+
+```bash
+python hb_finish.py --len 2 --data data_fin2      # and 3, 6
+python extract_features.py --data data_fin2 --cache cache_fin2
+python train_head.py --cache cache_fin2 cache_fin3 cache_fin6 --scales 2 3 6 \
+    --coarse --min-class 15 --out models/head_multiscale.joblib
+python predict.py bout.mp4 --model models/head_multiscale.joblib
+```
+
+`--scales` is not decoration: it records which clip length each 768-dim block came
+from, so `predict.py` can cut and embed the same windows from a new video. Without
+it the head trains fine and is then unusable, so `train_head.py` warns. Verified
+bit-exact: `predict.py`'s reconstructed vector matches the cached training vector at
+max|diff| 0.0. **The input must END at the finish** -- hand it a whole broadcast and
+every window lands in the ceremony.
+
 **Known gap.** A contact sheet of the 4s clips showed 5/6 holding the decisive
 moment, but one (`3j4r7V1bzlQ#2`, `oshitaoshi`) was pure aftermath -- a wrestler
 already down, then face close-ups -- so `bout_end` sometimes overshoots the finish.
-`hb_finish.py --tail N` exists to trim that and **has not been tested**. If the
-finish result is worth pushing further, that is the next cheap thing.
+`hb_finish.py --tail N` exists to trim that and **has not been tested**.
 
 Next experiments, cheapest first:
 
-1. **`--tail` sweep**, per the gap above: the measured win may be capped by clips
-   whose last seconds are aftermath rather than technique.
-2. **Concatenate whole-bout + finish-only embeddings** (1536-dim): keeps context,
-   adds resolution where the evidence is. This is why `hb_finish.py` writes a
-   separate directory instead of overwriting `data_hb/` -- both must exist at once.
-3. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result
-   says the framing was wrong; it does not say VideoMAE-base is sufficient.
-4. **Only then** label the remaining 68 videos. Adding data to this representation
-   is the experiment that already measured as no help.
+1. **`--tail` sweep**: the win may be capped by clips whose last seconds are
+   aftermath rather than technique. ~3 min per variant, and it composes with
+   multi-scale rather than competing with it.
+2. **More scales, or shorter ones** (1s, 1.5s). 2s+3s+6s beat 2s+3s+4s+6s, so this
+   is not monotone in the number of blocks -- measure, don't assume.
+3. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result says
+   the *framing* was wrong; it does not say VideoMAE-base is sufficient. Now worth
+   doing, because there is finally a signal to improve on rather than noise.
+4. **Then** label the remaining 68 videos. Worth revisiting *after* the above: the
+   "more data does not help" measurement was made on the whole-bout representation,
+   which is now known to be the broken one. A representation with real signal may
+   well have a different learning curve -- re-run the paired videos test before
+   committing an hour to labelling.
 
 **Cost, measured: ~2.5 s/bout** single-process, so 270 bouts ~11 min and all 1647
 ~70 min. Do not parallelize on a laptop -- see the note in `extract_strips()`;

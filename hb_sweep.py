@@ -36,6 +36,32 @@ from train_head import group_of
 
 CACHES = [("whole bout", "cache_hb"), ("2s", "cache_fin2"), ("3s", "cache_fin3"),
           ("4s", "cache_finish"), ("6s", "cache_fin6")]
+
+# Feature-level fusion, free to test: the caches are aligned clip-for-clip, so
+# concatenating two of them is a numpy call, not another encoder pass. Two distinct
+# hypotheses in here, worth keeping apart:
+#   * whole+finish -- context PLUS resolution. If the whole bout carries anything the
+#     finish lacks (the grip established at the charge, the approach), this recovers
+#     it. If the whole-bout half is pure noise, this should LOSE to finish alone,
+#     because 768 useless dimensions at n=191 cost real regularization budget.
+#   * finish+finish at two lengths -- multi-scale on the same evidence, no context
+#     claim. Tests whether the sampling rate itself is the limit.
+COMBOS = [("whole+6s", ["cache_hb", "cache_fin6"]),
+          ("whole+2s", ["cache_hb", "cache_fin2"]),
+          ("2s+6s", ["cache_fin2", "cache_fin6"]),
+          ("2s+3s+6s", ["cache_fin2", "cache_fin3", "cache_fin6"]),
+          ("2s+3s+4s+6s", ["cache_fin2", "cache_fin3", "cache_finish",
+                           "cache_fin6"]),
+          # CONTROLS, and they are load-bearing. A 3x wider feature block changes the
+          # regularization budget on its own at n=191, so "wider won and therefore
+          # multi-scale works" is not a valid inference without them. Repeating ONE
+          # cache three times holds dimensionality fixed at 2304 and adds exactly zero
+          # information. Measured: 6s x3 gains +0.002 over 6s alone while 2s+3s+6s
+          # gains +0.058 -- so the win is multi-scale content, not width. Keep these
+          # rows in any future sweep that adds a wider combo.
+          ("6s x3 CONTROL", ["cache_fin6"] * 3),
+          ("2s x3 CONTROL", ["cache_fin2"] * 3)]
+
 MIN_CLASS = 15
 N_FOLDS = 5
 
@@ -75,12 +101,12 @@ def main() -> None:
         if not d.exists():
             print(f"skip {label}: {cache}/ missing")
             continue
-        loaded.append((label, *load(d)))
+        loaded.append((label, cache, *load(d)))
     if len(loaded) < 2:
         sys.exit("need >=2 caches to compare")
 
-    ref_names = loaded[0][4]
-    for label, _, _, _, names in loaded[1:]:
+    ref_names = loaded[0][5]
+    for label, _, _, _, _, names in loaded[1:]:
         if names != ref_names:
             only_ref = sorted(set(ref_names) - set(names))[:3]
             only_this = sorted(set(names) - set(ref_names))[:3]
@@ -92,13 +118,13 @@ def main() -> None:
     # Fold the long tail exactly as train_head does, then build the folds ONCE and
     # reuse them for every cache. Labels and groups are identical across caches
     # (verified above), so one fold assignment is valid for all of them.
-    _, y, groups, _ = loaded[0][1:]
+    _, _, y, groups, _ = loaded[0][1:]
     c0 = Counter(y)
     rare = {k for k, n in c0.items() if n < MIN_CLASS and k != "other"}
     if rare:
         y = np.array(["other" if v in rare else v for v in y])
     counts = Counter(y)
-    folds = list(GroupKFold(n_splits=N_FOLDS).split(loaded[0][1], y, groups))
+    folds = list(GroupKFold(n_splits=N_FOLDS).split(loaded[0][2], y, groups))
 
     major = counts.most_common(1)[0]
     print(f"{len(y)} clips, {len(set(groups))} videos, {len(counts)} families "
@@ -107,15 +133,30 @@ def main() -> None:
           f"majority baseline (accuracy) = {major[1]/len(y):.3f} '{major[0]}'\n")
 
     results = {}
-    for label, X, _, _, _ in loaded:
+    for label, _, X, _, _, _ in loaded:
         results[label] = fold_scores(X, y, groups, folds)
 
-    print(f"{'window':<12}{'accuracy':>18}{'balanced acc':>18}{'f1_macro':>18}")
+    # Concatenations reuse the SAME already-loaded arrays and the SAME folds, so they
+    # cost no encoder time and stay paired with the single-cache rows above. Keyed off
+    # the cache name carried through load, NOT off zip(CACHES, loaded) -- a skipped
+    # cache would shift that zip and pair a label with the wrong array, which is the
+    # same class of silent mispairing the name check above exists to prevent.
+    by_cache = {cache: X for _, cache, X, *_ in loaded}
+    dims = {}
+    for label, parts in COMBOS:
+        if any(c not in by_cache for c in parts):
+            continue
+        Xc = np.hstack([by_cache[c] for c in parts])
+        dims[label] = Xc.shape[1]
+        results[label] = fold_scores(Xc, y, groups, folds)
+
+    print(f"{'features':<12}{'dim':>6}{'accuracy':>18}{'balanced acc':>18}"
+          f"{'f1_macro':>18}")
     for label in results:
         s = results[label]
         cells = "".join(f"{s[:, k].mean():>11.3f} +/-{s[:, k].std():>5.3f}"
                         for k in range(3))
-        print(f"{label:<12}{cells}")
+        print(f"{label:<12}{dims.get(label, 768):>6}{cells}")
 
     ref_label = loaded[0][0]
     ref = results[ref_label]

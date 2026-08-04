@@ -2,6 +2,12 @@
 
     python predict.py clip.mp4
     python predict.py https://youtu.be/XXXXXXXXXXX
+    python predict.py bout.mp4 --model models/head_multiscale.joblib
+
+IMPORTANT for the multi-scale model (the best one, see README): it was trained on
+the LAST N seconds of a bout at several N, so the input must END at the finish. Hand
+it a whole broadcast and every window lands in the post-bout ceremony. The model
+records its own scales, so this is automatic -- but the input framing is not.
 """
 
 import argparse
@@ -14,7 +20,7 @@ import joblib
 import numpy as np
 import torch
 
-from extract_features import decode_frames, embed, load_encoder
+from extract_features import clip_duration, decode_frames, embed, load_encoder
 from fetch_playlist import FORMAT
 
 
@@ -54,14 +60,36 @@ def main() -> None:
         if path is None:
             sys.exit(f"could not read {args.target}")
 
-        frames = decode_frames(path)
-        if frames is None:
-            sys.exit(f"could not decode {path}")
-
         # Same loader and same pooling as extract_features.py used to build the
         # cache the head was trained on -- see load_encoder() for why that matters.
         processor, model, _ = load_encoder(args.device)
-        emb = embed(frames, processor, model, args.device)
+
+        scales = bundle.get("scales")
+        if scales:
+            # Multi-scale head: it was trained on the last N seconds of the bout at
+            # several N, concatenated. Reproduce that here or the vector lands in a
+            # different space and the head returns confident nonsense. The input is
+            # assumed to END at the finish, which is what the training clips did.
+            dur = clip_duration(path)
+            if dur is None:
+                sys.exit(f"could not read the duration of {path}, which a "
+                         f"multi-scale model needs to cut its windows")
+            embs = []
+            for s in scales:
+                t0 = max(0.0, dur - s)
+                sub = decode_frames(path, t0=t0, t1=dur)
+                if sub is None:
+                    sys.exit(f"could not decode the last {s}s of {path}")
+                embs.append(embed(sub, processor, model, args.device))
+                print(f"  embedded last {s:g}s"
+                      + ("  (clip is shorter -- used all of it)"
+                         if dur < s else ""))
+            emb = np.concatenate(embs)
+        else:
+            frames = decode_frames(path)
+            if frames is None:
+                sys.exit(f"could not decode {path}")
+            emb = embed(frames, processor, model, args.device)
 
     if emb.shape[-1] != bundle["dim"]:
         sys.exit(f"embedding dim {emb.shape[-1]} != model's {bundle['dim']}")
