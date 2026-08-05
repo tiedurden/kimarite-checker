@@ -212,6 +212,8 @@ python hb_label.py --resume               # OCR -> data_hb/<kimarite>/*.mp4
 python hb_label.py --probe-window <id>    # then CHECK THE CLIPS HOLD THE BOUT
 python hb_recut.py --dry-run              # re-cut existing labels after a fix
 python hb_finish.py --len 3               # last 3s only -> data_finish/ (see below)
+python hb_sweep.py --lovo                 # compare framings; --lovo is not optional
+python hb_curve.py                        # does more data help THIS representation?
 ```
 
 Both probes are calibration, not decoration: `--probe` checks the caption is being
@@ -250,12 +252,11 @@ The decisive number is the permutation test, which got *worse*: p 0.120 -> 0.305
 sharpens when the data arrives; this collapsed toward the null. **The earlier
 p = 0.120 was noise.**
 
-**Scope that conclusion correctly.** It says *whole-bout* embeddings do not improve
-with more data -- it does NOT say the project is data-saturated. The finish-only and
-multi-scale results below overturned the representation this was measured on, so the
-learning curve has to be re-measured there before "more videos won't help" can be
-repeated. Reading it as a general claim is how a fixable framing bug gets mistaken
-for a ceiling.
+**That conclusion has since been overturned, and only ever applied to this
+representation.** Re-measured on multi-scale finish features, adding videos helps a
+great deal -- see "Does more data help?" below. Reading the whole-bout result as a
+general claim about the project is how a fixable framing bug gets mistaken for a
+ceiling, which is exactly what happened here for a while.
 
 So, with the input verified 100% bout footage and leaks masked, this is a statement
 about the framing: **frozen VideoMAE embeddings of WHOLE BOUT clips do not linearly
@@ -396,13 +397,66 @@ Both evaluations agree on what matters -- every finish variant beats the whole b
 `2s+3s+6s` and `2s+3s+4s+6s` swap places between the two schemes, which is the
 honest read: they are indistinguishable, and neither is "the" best.
 
+### Does more data help? On these features, yes -- a lot for the families
+
+`hb_curve.py`. Draw a random pool of *k* source videos, score leave-one-video-out
+within the pool, repeat. Pools are **nested**, so the same draw is evaluated at every
+*k* and the per-draw delta is paired -- between-video variance is enormous and
+cancels this way.
+
+Head to head at the endpoints of the original whole-bout test, 30 paired draws,
+identical code and draws:
+
+| features | 5 -> 12 videos | t | draws improving |
+|---|---|---|---|
+| whole bout | **-0.009** +/- 0.011 | -0.86 | 10/30 |
+| **2s+3s+6s** | **+0.110** +/- 0.009 | **+11.75** | **29/30** |
+
+The whole-bout row reproduces the earlier "no help" answer, and that is what makes
+the other row believable: same method, same draws, so the difference is the
+representation. Full multi-scale curve, 4 -> 13 videos:
+
+| videos | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| balanced acc | 0.304 | 0.317 | 0.337 | 0.371 | 0.369 | 0.384 | 0.404 | 0.418 | 0.427 | 0.466 |
+
+Monotone apart from one step, **still climbing at 13 videos**, local slope +0.017 per
+video. Do NOT extrapolate that: a linear fit puts 80 videos at 1.57 balanced
+accuracy, which is impossible. Learning curves saturate; the slope says the curve has
+not turned over yet, not where it lands. `hb_curve.py` prints that warning instead of
+a projected number, on purpose.
+
+Two controls rule out the obvious confound -- that 2304 dimensions simply need more
+data to fill:
+
+- a single **768-dim** finish cache also climbs steeply (+0.111, t = +10.5)
+- the **2304-dim zero-information** control (6s repeated 3x) climbs no faster
+  (+0.125) than the 768-dim cache it duplicates
+
+So the curve comes from the framing, not the width. **Labelling the remaining bouts
+is now justified, and it was not before.**
+
+**Weaker at technique granularity**, and the table above is a coarse-family result, so
+read it as one. `hb_curve.py --techniques`, same 30 draws:
+
+| videos | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| balanced acc | 0.322 | 0.330 | 0.339 | 0.345 | 0.355 | 0.370 | 0.361 | 0.374 | 0.379 | 0.366 |
+
+Paired 4 -> 13: **+0.044** +/- 0.014, t = +3.15, 22/30 draws improving, slope +0.006
+per video -- a third of the coarse slope, and it wobbles at the top (0.379 at 12,
+0.366 at 13). Positive and significant, not the same clean climb. That is the
+expected shape: the individual kimarite are long-tailed, so at 13 videos most classes
+have a handful of examples and get folded into `other`. It argues for more data rather
+than against it, but the honest claim is "families climb steeply, techniques climb
+slowly".
+
 Next experiments, cheapest first:
 
-1. **Re-run the learning curve on multi-scale features.** The "more videos does not
-   help" result was measured on the whole-bout representation, now known to be the
-   broken one, so it cannot be carried over. This is a pure-CPU paired test on
-   caches that already exist -- minutes, no labelling. It also decides whether step 4
-   is worth an hour, so do it first.
+1. **Label the remaining 67 videos** (~1377 bouts). Now the highest-value work rather
+   than the last resort: ~57 min labelling + ~27 min embedding, plus downloads, and
+   the curve says it should pay. Re-run `hb_curve.py` afterwards to see whether it is
+   saturating.
 2. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result says
    the *framing* was wrong; it does not say VideoMAE-base is sufficient. Now worth
    doing, because there is finally a signal to improve on rather than noise. Costs a
@@ -412,8 +466,6 @@ Next experiments, cheapest first:
    single largest available gain, and orthogonal to everything above. Verify it is
    not just re-reading the answer, same trap as the overlay -- the honest test is
    whether the *video* head improves, not the fused score.
-4. **Label the remaining 67 videos** (~1377 bouts, ~57 min label + ~27 min embed,
-   plus downloads). Gated on step 1.
 
 Not worth repeating: `--tail` (above), and whole-bout+finish fusion (+0.016 to
 +0.038; the whole-bout block contributes noise, not context).
