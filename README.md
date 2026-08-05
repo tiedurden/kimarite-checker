@@ -183,8 +183,13 @@ python extract_features.py
 python train_head.py                # top techniques + 'other'
 python train_head.py --coarse       # 6 official families -- easier, good sanity check
 
-# Best configuration measured (see "Multi-scale features" below): the same finish
-# embedded at 2s, 3s and 6s, concatenated into one 2304-dim feature.
+# Best configuration measured at the CURRENT 22 videos / 340 clips: the last 6s of
+# the bout, alone. Multi-scale (below) won at 13 videos and lost the lead as the set
+# grew -- so re-run hb_curve.py --versus after adding data instead of trusting this.
+python train_head.py --cache cache_fin6 --scales 6 \
+    --coarse --min-class 25 --out models/head_fin6.joblib
+
+# The former best, kept because it is what most of the tables below were measured on.
 python train_head.py --cache cache_fin2 cache_fin3 cache_fin6 --scales 2 3 6 \
     --coarse --min-class 15 --out models/head_multiscale.joblib
 ```
@@ -214,6 +219,9 @@ python hb_recut.py --dry-run              # re-cut existing labels after a fix
 python hb_finish.py --len 3               # last 3s only -> data_finish/ (see below)
 python hb_sweep.py --lovo                 # compare framings; --lovo is not optional
 python hb_curve.py                        # does more data help THIS representation?
+python hb_curve.py --versus cache_fin6    # paired A/B at every pool size
+python hb_batch.py --dry-run              # plan the next download/label/embed batch
+python hb_batch.py --batches 3            # run three (~20 min each, sequential)
 ```
 
 Both probes are calibration, not decoration: `--probe` checks the caption is being
@@ -300,7 +308,14 @@ supports is "anything but the whole bout", not an optimum. Also note no window
 beats the 0.597 majority baseline on plain accuracy yet; the model is now clearly
 better than chance and still not better than always guessing `kihonwaza`.
 
-### Multi-scale features: the best result so far
+### Multi-scale features: the best result at 13 videos, since overtaken
+
+> **Superseded at 22 videos.** Everything in this section was measured on 191 clips
+> from 13 videos and reproduces exactly. It no longer describes the best
+> configuration: plain 6s overtook multi-scale as the set grew -- see
+> [Which framing wins depends on how much data you have](#which-framing-wins-depends-on-how-much-data-you-have).
+> Kept in full because the controls below are still the reason to believe multi-scale
+> was doing something real, and because a superseded measurement is not a wrong one.
 
 Concatenating the *same* finish at several lengths beats any single length. This is
 free to test -- the caches are aligned clip-for-clip, so it is a `numpy.hstack`, not
@@ -451,12 +466,55 @@ have a handful of examples and get folded into `other`. It argues for more data 
 than against it, but the honest claim is "families climb steeply, techniques climb
 slowly".
 
+### Which framing wins depends on how much data you have
+
+The curve said labelling would pay, so `hb_batch.py` took the set from **13 videos /
+191 clips to 22 / 340**. It did pay -- and it changed the answer to a question that
+looked settled.
+
+Paired on identical video pools, `--min-class 25` so the task stays the same 4
+families (chance 0.250) rather than gaining a fifth as `hinerite` crosses the
+threshold -- balanced accuracy is not comparable across a different class count:
+
+```bash
+python hb_curve.py --versus cache_fin6 --min-class 25 --sizes 6 10 14 18 22
+```
+
+| videos | 2s+3s+6s | 6s alone | delta | t |
+|---|---|---|---|---|
+| 6 | 0.324 | 0.326 | -0.002 | -0.18 |
+| 10 | 0.356 | 0.362 | -0.006 | -0.63 |
+| 14 | 0.367 | 0.377 | -0.010 | -1.86 |
+| 18 | 0.377 | 0.399 | **-0.022** | **-3.79** |
+| 22 | 0.382 | **0.427** | **-0.045** | exact* |
+
+<sub>*at 22 the pool is every video, so there is one deterministic answer and no
+spread -- `hb_curve.py` prints `exact` rather than dividing by ~0.</sub>
+
+**A crossover**, which is why the comparison prints every size and not just the
+endpoints. The two are tied to ~10 videos, then 6s pulls away. Multi-scale flattens
+after 16 (0.377, 0.377, 0.382) while 6s keeps climbing -- slope **+0.0067/video vs
++0.0041**. The reading: 2304 dimensions at 191 clips bought regularization the head
+no longer needs at 340, and the 2s/3s blocks are largely redundant with the 6s one.
+
+What this does *not* overturn, because it is easy to over-correct here:
+
+- **finish-vs-whole-bout still holds** -- 6s beats the whole bout by +0.107,
+  t = +2.26 on LOVO at 22 videos
+- **more data still helps** -- the curve is what says so: 6s goes 0.284 (4 videos) ->
+  0.427 (22), paired **+0.143, t = +12.11, 30/30 draws**
+- the multi-scale controls were still sound; multi-scale really did win at n=191
+
+What changed is *which* framing wins, i.e. a decision to be **re-made at each data
+size** rather than settled once. Treat every table above as a measurement at its own
+n, and re-run `hb_curve.py --versus` after each batch.
+
 Next experiments, cheapest first:
 
-1. **Label the remaining 67 videos** (~1377 bouts). Now the highest-value work rather
-   than the last resort: ~57 min labelling + ~27 min embedding, plus downloads, and
-   the curve says it should pay. Re-run `hb_curve.py` afterwards to see whether it is
-   saturating.
+1. **Keep labelling** -- 59 videos / ~1240 bouts left, `python hb_batch.py`. Two
+   batches done (17 min and 24 min); both curves are still climbing at 22 videos, so
+   this is still the highest-value work. Re-run `hb_curve.py --versus cache_fin6`
+   after each batch: the winning configuration has already changed once.
 2. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result says
    the *framing* was wrong; it does not say VideoMAE-base is sufficient. Now worth
    doing, because there is finally a signal to improve on rather than noise. Costs a

@@ -140,19 +140,52 @@ def main() -> None:
     if len(loaded) < 2:
         sys.exit("need >=2 caches to compare")
 
-    ref_names = loaded[0][5]
-    for label, _, _, _, _, names in loaded[1:]:
-        if names != ref_names:
-            only_ref = sorted(set(ref_names) - set(names))[:3]
-            only_this = sorted(set(names) - set(ref_names))[:3]
-            sys.exit(f"clip sets differ: {loaded[0][0]} has {len(ref_names)}, "
-                     f"{label} has {len(names)}.\n  only in {loaded[0][0]}: "
-                     f"{only_ref}\n  only in {label}: {only_this}\n"
-                     f"Paired deltas would compare different bouts -- aborting.")
+    # Reference = the cache with the MOST clips, so a cache left behind by the last
+    # hb_batch.py run is recognised as stale rather than becoming the standard that
+    # everything else is judged against.
+    full_i = max(range(len(loaded)), key=lambda i: len(loaded[i][5]))
+    full_label, full_names = loaded[full_i][0], loaded[full_i][5]
+    full_set = set(full_names)
+
+    # Two different situations, and conflating them is what made this abort on a
+    # perfectly normal state. A cache holding a strict SUBSET of the reference is
+    # merely out of date -- hb_batch.py only re-embeds the scales it was asked for,
+    # so 4s and the tail caches sit at 191 clips while the rest moved to 340. That is
+    # safe to DROP: the row vanishes from the table and nothing is mispaired.
+    #
+    # A cache holding clips the reference does NOT have is a real conflict -- two
+    # datasets built from different labels -- and still aborts, because pairing fold
+    # i of one against different bouts in another is exactly the silent corruption
+    # this check exists to prevent.
+    fresh, stale = [], []
+    for entry in loaded:
+        label, names = entry[0], entry[5]
+        if names == full_names:
+            fresh.append(entry)
+        elif set(names) < full_set:
+            stale.append((label, len(names)))
+        else:
+            extra = sorted(set(names) - full_set)[:3]
+            sys.exit(f"clip sets CONFLICT: {label} has {len(names)} clips including "
+                     f"{extra}\nwhich {full_label} ({len(full_names)}) does not. "
+                     f"Neither is a subset of the other, so one of them was built "
+                     f"from different labels.\nPaired deltas would compare different "
+                     f"bouts -- aborting.")
+    if stale:
+        print(f"dropping {len(stale)} cache(s) left behind by the last batch "
+              f"(reference {full_label} has {len(full_names)} clips):")
+        for label, n in stale:
+            print(f"  {label:<18} {n} clips -- re-embed it to score it again")
+        print()
+    loaded = fresh
+    if len(loaded) < 2:
+        sys.exit(f"only {len(loaded)} cache(s) are in step with {full_label} "
+                 f"({len(full_names)} clips) -- need >=2 to compare")
 
     # Fold the long tail exactly as train_head does, then build the folds ONCE and
-    # reuse them for every cache. Labels and groups are identical across caches
-    # (verified above), so one fold assignment is valid for all of them.
+    # reuse them for every cache. Every surviving cache holds the identical clip list
+    # (the check above dropped or rejected the rest), so labels and groups match and
+    # one fold assignment is valid for all of them.
     _, _, y, groups, _ = loaded[0][1:]
     c0 = Counter(y)
     rare = {k for k, n in c0.items() if n < args.min_class and k != "other"}

@@ -55,6 +55,32 @@ draws, slope +0.006/video against +0.017 for the families, and the curve wobbles
 clean steep climb is a coarse-family result. Expected, and it argues for MORE data
 rather than less: the individual techniques are long-tailed, so most classes here are
 in the regime where a handful of examples per class is the binding constraint.
+
+--- AT 22 VIDEOS, MULTI-SCALE LOSES TO PLAIN 6s. That is why --versus exists. ---
+
+Re-measured after hb_batch.py took the set from 13 videos / 191 clips to 22 / 340,
+paired on identical pools (--versus cache_fin6, --min-class 25 to hold the task at
+the same 4 families, chance 0.250):
+
+    videos   2s+3s+6s      6s     delta       t
+         6      0.324   0.326    -0.002   -0.18
+        10      0.356   0.362    -0.006   -0.63
+        14      0.367   0.377    -0.010   -1.86
+        18      0.377   0.399    -0.022   -3.79
+        22      0.382   0.427    -0.045   exact
+
+A CROSSOVER, and the reason to print every size rather than the endpoints: the two
+are tied up to ~10 videos, then 6s pulls away. Multi-scale flattens after 16 (0.377,
+0.377, 0.382) while 6s keeps climbing (slope +0.0067/video against +0.0041). So the
+multi-scale win was real at 13 videos and is now a ceiling: 2304 dimensions at 191
+clips bought regularization that 340 clips no longer need, and the 2s/3s blocks are
+mostly redundant with the 6s one.
+
+Note what this does NOT overturn. Finish-vs-whole-bout still holds (6s beats the
+whole bout by +0.107, t = +2.26 on LOVO), and more data still helps -- the curve is
+what says so. What changed is which finish framing wins, i.e. a decision that has to
+be RE-MADE at each data size rather than settled once. Read the multi-scale tables
+below and in the README as measurements at n=191, not as standing conclusions.
 """
 
 import argparse
@@ -104,6 +130,12 @@ def score_pool(X, y, groups, pool, rng) -> float | None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", nargs="+", default=MULTISCALE, type=Path)
+    ap.add_argument("--versus", nargs="+", type=Path, default=None,
+                    help="second feature set, scored on the SAME pools so the "
+                         "difference is paired per draw. Comparing two separate runs "
+                         "by eye is how the --tail result got believed: at 22 videos "
+                         "6s leads 2s+3s+6s by 0.045 balanced accuracy on LOVO at "
+                         "only t = -1.32, i.e. not resolved.")
     ap.add_argument("--draws", type=int, default=30)
     ap.add_argument("--sizes", type=int, nargs="+", default=None,
                     help="pool sizes to test (default: 4 .. all videos)")
@@ -116,7 +148,19 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    X, y, groups, _ = load_many(args.cache)
+    X, y, groups, names = load_many(args.cache)
+    X2 = None
+    if args.versus:
+        X2, y2, groups2, names2 = load_many(args.versus)
+        # Same clips in the same ORDER, or row i of one matrix is a different bout
+        # than row i of the other and every paired delta is noise. load_many already
+        # aborts on a mismatch within one feature set; this is the same check across
+        # the two being compared, and it is the whole basis of the pairing.
+        if names2 != names:
+            sys.exit(f"--versus holds {len(names2)} clips, --cache holds {len(names)}"
+                     f" -- and they must be the identical list in identical order.\n"
+                     f"Re-embed the stale one (hb_batch.py only refreshes the scales "
+                     f"it is given).")
     if not args.techniques:
         y = np.array([kimarite.coarse(v) or "other" for v in y])
     rare = {k for k, n in Counter(y).items() if n < args.min_class and k != "other"}
@@ -141,18 +185,54 @@ def main() -> None:
     # what makes the deltas paired.
     rng = np.random.default_rng(args.seed)
     curve: dict[int, list[float]] = {s: [] for s in sizes}
+    curve2: dict[int, list[float]] = {s: [] for s in sizes}
     for d in range(args.draws):
         order = rng.permutation(vids)
         for s in sizes:
             got = score_pool(X, y, groups, order[:s], rng)
-            if got is not None:
-                curve[s].append(got)
+            if got is None:
+                continue
+            if X2 is not None:
+                # Same pool, same held-out video, same folds -- so the only thing
+                # differing is the feature block. Appended only when BOTH scored, or
+                # the two lists drift out of alignment and the "paired" delta at
+                # index i would subtract different draws.
+                other = score_pool(X2, y, groups, order[:s], rng)
+                if other is None:
+                    continue
+                curve2[s].append(other)
+            curve[s].append(got)
 
-    print(f"{'videos':>7}{'bal acc':>12}{'se':>9}{'n draws':>9}")
-    for s in sizes:
-        v = np.array(curve[s])
-        se = v.std(ddof=1) / np.sqrt(len(v)) if len(v) > 1 else float("nan")
-        print(f"{s:>7}{v.mean():>12.3f}{se:>9.3f}{len(v):>9}")
+    if X2 is None:
+        print(f"{'videos':>7}{'bal acc':>12}{'se':>9}{'n draws':>9}")
+        for s in sizes:
+            v = np.array(curve[s])
+            se = v.std(ddof=1) / np.sqrt(len(v)) if len(v) > 1 else float("nan")
+            print(f"{s:>7}{v.mean():>12.3f}{se:>9.3f}{len(v):>9}")
+    else:
+        # Per-size paired delta. A head-to-head that only reports the endpoints hides
+        # a CROSSOVER, which is exactly what is in question here: multi-scale leads at
+        # small pools and flattens, plain 6s keeps climbing. One number for the whole
+        # range would average those into "no difference".
+        a_name = "+".join(c.name.replace("cache_", "") for c in args.cache)
+        b_name = "+".join(c.name.replace("cache_", "") for c in args.versus)
+        print(f"{'videos':>7}{a_name:>14}{b_name:>14}{'delta':>9}{'t':>7}"
+              f"{'n':>5}")
+        for s in sizes:
+            a, b = np.array(curve[s]), np.array(curve2[s])
+            d = a - b
+            se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else float("nan")
+            # A pool as large as the whole video set is the SAME pool in every draw,
+            # so the delta has no variance and t is meaningless -- floating-point
+            # noise over ~0 printed as t = -1.7e16 once. That row is a single
+            # deterministic measurement, not 30 samples; say so instead of a t.
+            t = (f"{d.mean() / se:>+7.2f}" if se and se > 1e-12
+                 else f"{'exact':>7}")
+            print(f"{s:>7}{a.mean():>14.3f}{b.mean():>14.3f}{d.mean():>+9.3f}"
+                  f"{t}{len(d):>5}")
+        print(f"\n(delta = {a_name} minus {b_name}, paired within each draw; "
+              f"|t| >= 2 is resolved.\n'exact' = the pool is every video, so there is "
+              f"one deterministic answer and no spread.)")
 
     # The paired test, on draws that produced a score at BOTH ends. Slicing to a
     # common length would silently pair draw i at one size with draw j at the other
