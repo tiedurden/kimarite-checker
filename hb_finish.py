@@ -97,6 +97,13 @@ def main() -> None:
                     help="drop this many seconds from the very end (walk-off guard); "
                          "measured as NO help on this source -- see the module "
                          "docstring before using it")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="leave clips that are already cut alone. For batched "
+                         "labelling (hb_batch.py), where this script runs once per "
+                         "batch over a growing hb_labels.csv and would otherwise "
+                         "re-encode every earlier clip each time. NOT safe after "
+                         "hb_recut.py changes bout_start/bout_end -- the stale clip "
+                         "keeps the old window; delete the dir and re-cut instead.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -112,11 +119,19 @@ def main() -> None:
           f"{args.len:.1f}s of each\n")
 
     dims: dict[str, tuple[int, int]] = {}
-    cut, failed, whole = 0, 0, 0
+    cut, failed, whole, have = 0, 0, 0, 0
     spans: list[float] = []
     per_class: Counter = Counter()
 
     for i, r in enumerate(rows, 1):
+        dest = args.data / r["kimarite"] / f"{r['video']}__{int(r['n']):02d}.mp4"
+        # Checked before the raw/ glob and probe_dims, so an already-cut clip costs
+        # nothing at all. Batched labelling re-runs this script over a growing
+        # hb_labels.csv, and re-encoding every earlier clip each time is ~1s/bout of
+        # pure waste that grows linearly with progress.
+        if args.skip_existing and dest.exists():
+            have += 1
+            continue
         vids = list(args.raw.glob(f"*{r['video']}*.mp4"))
         if not vids:
             print(f"[{i}/{len(rows)}] {r['video']}#{r['n']}  SKIP -- not downloaded")
@@ -140,7 +155,6 @@ def main() -> None:
             cut += 1
             continue
 
-        dest = args.data / r["kimarite"] / f"{r['video']}__{int(r['n']):02d}.mp4"
         if cut_clip(path, dest, start, end, mask_filter(w, h)):
             cut += 1
         else:
@@ -150,7 +164,8 @@ def main() -> None:
             print(f"  [{i}/{len(rows)}] {cut} cut")
 
     verb = "would cut" if args.dry_run else "cut"
-    print(f"\n{verb} {cut}, {failed} ffmpeg failures")
+    print(f"\n{verb} {cut}, {failed} ffmpeg failures"
+          + (f", {have} already present" if have else ""))
     if spans:
         s = sorted(spans)
         print(f"span: min {s[0]:.1f}s  median {s[len(s)//2]:.1f}s  max {s[-1]:.1f}s")
