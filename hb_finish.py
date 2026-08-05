@@ -25,8 +25,27 @@ RESULT: it works. Paired per-fold against the whole bout on identical folds, all
 of 2/3/4/6s improve balanced accuracy by +0.077 to +0.120 with 4/5 folds up (2s
 t = +2.50, the rest t = 1.7-1.9). The lengths do not separate from each other
 (pairwise |t| <= 1.72), so this is evidence for "not the whole bout", not for any
-particular length. Run hb_sweep.py to reproduce. Caveat worth keeping in view: no
-window beats the 0.597 majority baseline on plain accuracy yet.
+particular length. Run hb_sweep.py to reproduce.
+
+--tail DOES NOT HELP, and the way it looked like it did is worth keeping on record.
+bout_end really does overshoot into the walk-off, so trimming 1s first is a
+reasonable idea, and on 5-fold GroupKFold it measured +0.052 balanced accuracy on
+the 2s clip at t = +3.99, 5/5 folds -- with a credible non-monotone shape (tail=2
+lost 0.068, i.e. 1s removes aftermath, 2s eats the technique). Convincing.
+
+It did not survive leave-one-video-out. Over 13 deterministic folds the trimmed
+multi-scale config scores 0.451 against 0.466 for the untrimmed one, t = -0.35,
+4/13 folds up. The 5-fold win was fold-assignment luck, found while scoring 18
+configurations and reporting the maximum -- selection on noise.
+
+So: leave --tail at 0. The flag stays because the overshoot is real and a different
+source with longer walk-offs may need it, but on THIS data it buys nothing. General
+lesson, and the third time this project has hit it: validate a promising number
+under a different split before believing it, especially one picked as the best of
+many. Multi-scale (below) survived that check; this did not.
+
+Best measured configuration: 2s + 3s + 6s untrimmed, 0.480 balanced accuracy on
+5-fold / 0.466 on leave-one-video-out, permutation p = 0.005 z = +6.75.
 
 This writes a SEPARATE dataset directory rather than overwriting data_hb/. Three
 reasons: the whole-bout numbers stay reproducible for comparison, a null result
@@ -75,7 +94,9 @@ def main() -> None:
     ap.add_argument("--len", type=float, default=FINISH_LEN,
                     help=f"seconds of finish to keep (default {FINISH_LEN})")
     ap.add_argument("--tail", type=float, default=0.0,
-                    help="drop this many seconds from the very end (walk-off guard)")
+                    help="drop this many seconds from the very end (walk-off guard); "
+                         "measured as NO help on this source -- see the module "
+                         "docstring before using it")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

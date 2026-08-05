@@ -367,26 +367,56 @@ bit-exact: `predict.py`'s reconstructed vector matches the cached training vecto
 max|diff| 0.0. **The input must END at the finish** -- hand it a whole broadcast and
 every window lands in the ceremony.
 
-**Known gap.** A contact sheet of the 4s clips showed 5/6 holding the decisive
-moment, but one (`3j4r7V1bzlQ#2`, `oshitaoshi`) was pure aftermath -- a wrestler
-already down, then face close-ups -- so `bout_end` sometimes overshoots the finish.
-`hb_finish.py --tail N` exists to trim that and **has not been tested**.
+**Validate under leave-one-video-out before believing a best-of-N number.**
+`hb_sweep.py --lovo` scores 13 deterministic folds instead of 5 random ones. This is
+not optional hygiene, it caught a real mistake: `--tail 1` (trim the walk-off off
+`bout_end` before cutting the finish) measured **+0.052 balanced accuracy at
+t = +3.99, 5/5 folds** on GroupKFold, with a credible non-monotone shape (`--tail 2`
+lost 0.068, i.e. 1s removes aftermath and 2s eats the technique). It was reported as
+a win. Under LOVO the trimmed multi-scale config scores **0.451 vs 0.466 untrimmed,
+t = -0.35, 4/13 folds up** -- the 5-fold result was fold-assignment luck, surfaced by
+scoring 18 configurations and taking the maximum. `--tail` stays at 0.
+
+The overshoot itself is real (a contact sheet showed one 4s clip, `3j4r7V1bzlQ#2`,
+holding only aftermath), so the flag stays for a source with longer walk-offs. It
+just does not pay here. `hb_sweep.py` refuses to print a table without reminding you
+to re-run with `--lovo`.
+
+Both evaluations agree on what matters -- every finish variant beats the whole bout
+(LOVO t = +2.07 to +4.74) and multi-scale tops both tables:
+
+| config | 5-fold bal acc | LOVO bal acc (13 folds) |
+|---|---|---|
+| whole bout | 0.302 | 0.270 |
+| 6s alone | 0.422 | 0.420 |
+| 2s+3s+6s | **0.480** | **0.466** |
+| 2s+3s+4s+6s | 0.463 | **0.478** |
+| tail-trimmed variants | 0.423-0.518 | 0.401-0.451 |
+
+`2s+3s+6s` and `2s+3s+4s+6s` swap places between the two schemes, which is the
+honest read: they are indistinguishable, and neither is "the" best.
 
 Next experiments, cheapest first:
 
-1. **`--tail` sweep**: the win may be capped by clips whose last seconds are
-   aftermath rather than technique. ~3 min per variant, and it composes with
-   multi-scale rather than competing with it.
-2. **More scales, or shorter ones** (1s, 1.5s). 2s+3s+6s beat 2s+3s+4s+6s, so this
-   is not monotone in the number of blocks -- measure, don't assume.
-3. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result says
+1. **Re-run the learning curve on multi-scale features.** The "more videos does not
+   help" result was measured on the whole-bout representation, now known to be the
+   broken one, so it cannot be carried over. This is a pure-CPU paired test on
+   caches that already exist -- minutes, no labelling. It also decides whether step 4
+   is worth an hour, so do it first.
+2. **Swap the encoder** (`MODEL_ID`, V-JEPA 2 / InternVideo2). The finish result says
    the *framing* was wrong; it does not say VideoMAE-base is sufficient. Now worth
-   doing, because there is finally a signal to improve on rather than noise.
-4. **Then** label the remaining 68 videos. Worth revisiting *after* the above: the
-   "more data does not help" measurement was made on the whole-bout representation,
-   which is now known to be the broken one. A representation with real signal may
-   well have a different learning curve -- re-run the paired videos test before
-   committing an hour to labelling.
+   doing, because there is finally a signal to improve on rather than noise. Costs a
+   re-embed of every cache (~2 s/clip) and nothing else -- `train_head.py` is
+   unchanged.
+3. **Audio via Whisper.** Announcers frequently *say* the technique. Likely the
+   single largest available gain, and orthogonal to everything above. Verify it is
+   not just re-reading the answer, same trap as the overlay -- the honest test is
+   whether the *video* head improves, not the fused score.
+4. **Label the remaining 67 videos** (~1377 bouts, ~57 min label + ~27 min embed,
+   plus downloads). Gated on step 1.
+
+Not worth repeating: `--tail` (above), and whole-bout+finish fusion (+0.016 to
++0.038; the whole-bout block contributes noise, not context).
 
 **Cost, measured: ~2.5 s/bout** single-process, so 270 bouts ~11 min and all 1647
 ~70 min. Do not parallelize on a laptop -- see the note in `extract_strips()`;
